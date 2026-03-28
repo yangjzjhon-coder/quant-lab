@@ -1,0 +1,23 @@
+$ErrorActionPreference = "Stop"
+
+$Distro = "Ubuntu-24.04"
+$WslUser = "wu"
+$ProjectWindowsDir = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$ProjectDrive = $ProjectWindowsDir.Substring(0, 1).ToLowerInvariant()
+$ProjectTail = $ProjectWindowsDir.Substring(2).Replace('\', '/')
+$ProjectDir = "/mnt/$ProjectDrive$ProjectTail"
+$LinuxScript = "$ProjectDir/scripts/quant_lab_service.sh"
+
+Write-Host ""
+Write-Host "=== Quant Lab Stop Script ===" -ForegroundColor Cyan
+Write-Host ""
+
+wsl -d $Distro -u $WslUser -- bash -lc "cd '$ProjectDir' && chmod +x '$LinuxScript' && '$LinuxScript' stop"
+if ($LASTEXITCODE -ne 0) {
+    throw "quant-lab service failed to stop."
+}
+
+Write-Host ""
+if ($env:QUANT_LAB_NO_PAUSE -ne "1") {
+    Read-Host "Press Enter to close"
+}

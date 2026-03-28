@@ -1,0 +1,151 @@
+# BTC + ETH 双标的研究流
+
+当前这一步已经把 `quant-lab` 的研究层从单标的升级成了双标的组合研究流。
+
+## 现在已经能做什么
+
+- 同时下载 `BTC-USDT-SWAP` 和 `ETH-USDT-SWAP` 的 OKX 历史数据
+- 自动缓存两个标的的合约元数据，减少回测时对实时网络的依赖
+- 分别回测两个标的的 sleeve
+- 按等权初始资金自动汇总成一个组合级权益曲线
+- 生成三类结果：
+  - `BTC sleeve`
+  - `ETH sleeve`
+  - `BTC+ETH portfolio`
+
+## 默认配置
+
+当前 `config/settings.yaml` 已包含：
+
+```yaml
+portfolio:
+  symbols:
+    - BTC-USDT-SWAP
+    - ETH-USDT-SWAP
+```
+
+这意味着下面三条命令默认就是双标的模式。
+
+## 最短使用路径
+
+在 `WSL Ubuntu-24.04` 里进入项目目录：
+
+```bash
+cd /mnt/e/quant-lab
+```
+
+1. 下载双标的数据
+
+```bash
+.venv/bin/python -m quant_lab download \
+  --config config/settings.yaml \
+  --start 2023-01-01 \
+  --end 2026-03-26
+```
+
+2. 跑双标组合回测
+
+```bash
+.venv/bin/python -m quant_lab backtest \
+  --config config/settings.yaml
+```
+
+3. 生成双标报表
+
+```bash
+.venv/bin/python -m quant_lab report \
+  --config config/settings.yaml
+```
+
+## 结果文件位置
+
+生成后重点看 `data/reports/`：
+
+- `BTC-USDT-SWAP_breakout_retest_4h_sleeve_dashboard.html`
+- `ETH-USDT-SWAP_breakout_retest_4h_sleeve_dashboard.html`
+- `portfolio_btc_eth_breakout_retest_4h_dashboard.html`
+- `portfolio_btc_eth_breakout_retest_4h_sleeves.csv`
+
+其中：
+
+- `sleeve_dashboard.html` 是单标的结果
+- `portfolio_..._dashboard.html` 是组合结果
+- `portfolio_..._sleeves.csv` 是两个 sleeve 的对比表
+
+## 如果只想临时跑单标的
+
+只跑 BTC：
+
+```bash
+.venv/bin/python -m quant_lab backtest \
+  --config config/settings.yaml \
+  --symbols BTC-USDT-SWAP
+```
+
+只跑 ETH：
+
+```bash
+.venv/bin/python -m quant_lab backtest \
+  --config config/settings.yaml \
+  --symbols ETH-USDT-SWAP
+```
+
+## 当前边界
+
+这次已经完成两层：
+
+- 研究层：
+  - 双标下载
+  - 双标回测
+  - 组合聚合
+  - 组合报表
+- 执行底座层：
+  - `demo-portfolio-plan`
+  - `demo-portfolio-reconcile`
+  - `demo-portfolio-drill`
+  - `demo-portfolio-loop`
+  - 双标共享账户、逐标计划、逐标去重、组合心跳落库
+
+还没完全扩到：
+
+- 双标 service/client 可视化联动
+- 更严格的组合级动态风控闸门
+- 双标模拟盘的一键桌面守护入口
+
+下一步最值得做的是：
+
+1. 把 service/client 面板扩成真正的双标视图
+2. 加组合级风险约束
+3. 再把双标桌面守护启动做成傻瓜版入口
+
+## 双标 demo 命令
+
+在 `WSL Ubuntu-24.04` 中：
+
+```bash
+cd /mnt/e/quant-lab
+```
+
+查看双标计划：
+
+```bash
+.venv/bin/python -m quant_lab demo-portfolio-plan --config config/settings.yaml
+```
+
+查看双标对账：
+
+```bash
+.venv/bin/python -m quant_lab demo-portfolio-reconcile --config config/settings.yaml
+```
+
+跑一轮双标演练：
+
+```bash
+.venv/bin/python -m quant_lab demo-portfolio-drill --config config/settings.yaml
+```
+
+持续跑双标循环：
+
+```bash
+.venv/bin/python -m quant_lab demo-portfolio-loop --config config/settings.yaml
+```

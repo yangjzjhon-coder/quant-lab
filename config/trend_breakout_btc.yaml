@@ -1,0 +1,119 @@
+okx:
+  rest_base_url: https://www.okx.com
+  profile: okx-demo
+  use_demo: true
+
+instrument:
+  symbol: BTC-USDT-SWAP
+  instrument_type: SWAP
+  contract_value: 0.01
+  contract_value_currency: BTC
+  lot_size: 0.01
+  min_size: 0.01
+  tick_size: 0.1
+  settle_currency: USDT
+
+portfolio:
+  symbols:
+    - BTC-USDT-SWAP
+
+strategy:
+  name: trend_breakout_4h
+  variant: trend_breakout_long
+  signal_bar: 4H
+  execution_bar: 1m
+  fast_ema: 20
+  slow_ema: 50
+  trend_ema: 80
+  atr_period: 14
+  atr_stop_multiple: 3.0
+  adx_period: 14
+  adx_threshold: 18.0
+  allow_short: false
+  volume_window: 24
+  min_volume_ratio: 0.95
+  cmf_period: 20
+  min_cmf_abs: 0.01
+  min_body_atr_ratio: 0.05
+  volatility_window: 72
+  min_volatility_ratio: 0.8
+  max_volatility_ratio: 2.8
+  breakout_buffer_atr: 0.05
+  retest_tolerance_atr: 0.35
+  max_breakout_extension_atr: 1.2
+  min_channel_width_atr: 1.0
+  min_trend_score: 60.0
+  trend_slope_window: 3
+  min_trend_slope_atr: 0.03
+  min_ema_spread_atr: 0.12
+  use_public_factor_overlay: true
+  min_public_factor_score: 0.35
+
+execution:
+  initial_equity: 10000.0
+  fee_bps: 8.0
+  slippage_bps: 6.0
+  latency_minutes: 1
+  minimum_notional: 25.0
+  max_leverage: 3.0
+  max_bar_participation: 0.08
+  market_impact_bps: 18.0
+  excess_impact_bps: 30.0
+  volatility_impact_share: 0.35
+  funding_interval_hours: 8
+  missing_funding_rate_bps: 1.5
+
+risk:
+  risk_per_trade: 0.02
+  weekly_drawdown_pause: 0.06
+  portfolio_max_total_risk: 0.03
+  portfolio_max_same_direction_risk: 0.025
+
+trading:
+  td_mode: cross
+  position_mode: long_short_mode
+  order_type: market
+  signal_lookback_bars: 240
+  execution_lookback_bars: 1440
+  poll_interval_seconds: 60
+  allow_order_placement: false
+  max_order_contracts: null
+  attach_stop_loss_on_entry: true
+  stop_trigger_price_type: mark
+  order_tag: quantlab
+
+storage:
+  data_dir: data
+  raw_dir: data/raw
+  report_dir: data/reports
+
+database:
+  url: sqlite:///data/quant_lab.db
+
+service:
+  host: 0.0.0.0
+  port: 18080
+  heartbeat_interval_seconds: 60
+  report_stale_minutes: 180
+
+alerts:
+  telegram_enabled: false
+  telegram_bot_token: null
+  telegram_chat_id: null
+  email_enabled: false
+  email_from: null
+  email_to: []
+  email_subject_prefix: "[quant-lab]"
+  smtp_host: null
+  smtp_port: 465
+  smtp_username: null
+  smtp_password: null
+  smtp_use_tls: false
+  smtp_use_ssl: true
+  smtp_timeout_seconds: 20.0
+  send_on_halt: true
+  send_on_recovery: true
+  send_on_report_stale: true
+  send_on_demo_submit: true
+  send_on_demo_error: true
+  demo_error_cooldown_seconds: 900

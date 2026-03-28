@@ -1,0 +1,39 @@
+$ErrorActionPreference = "Stop"
+
+$Distro = "Ubuntu-24.04"
+$WslUser = "wu"
+$ProjectWindowsDir = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$ProjectDrive = $ProjectWindowsDir.Substring(0, 1).ToLowerInvariant()
+$ProjectTail = $ProjectWindowsDir.Substring(2).Replace('\', '/')
+$ProjectDir = "/mnt/$ProjectDrive$ProjectTail"
+$LinuxScript = "$ProjectDir/scripts/quant_lab_service.sh"
+$Url = "http://127.0.0.1:18080/"
+
+Write-Host ""
+Write-Host "=== Quant Lab Start Script ===" -ForegroundColor Cyan
+Write-Host ""
+
+Write-Host "[1/3] Starting quant-lab service in WSL..." -ForegroundColor Yellow
+wsl -d $Distro -u $WslUser -- bash -lc "cd '$ProjectDir' && chmod +x '$LinuxScript' && '$LinuxScript' start"
+if ($LASTEXITCODE -ne 0) {
+    throw "quant-lab service failed to start."
+}
+
+Write-Host "[2/3] Checking localhost health..." -ForegroundColor Yellow
+$health = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:18080/health"
+Write-Host "      $($health.Content)" -ForegroundColor Green
+
+Write-Host "[3/3] Opening browser..." -ForegroundColor Yellow
+if ($env:QUANT_LAB_SKIP_BROWSER -eq "1") {
+    Write-Host "      Browser open skipped" -ForegroundColor DarkYellow
+} else {
+    Start-Process $Url
+}
+
+Write-Host ""
+Write-Host "Done. Runtime dashboard:" -ForegroundColor Green
+Write-Host "  $Url" -ForegroundColor White
+Write-Host ""
+if ($env:QUANT_LAB_NO_PAUSE -ne "1") {
+    Read-Host "Press Enter to close"
+}

@@ -1,0 +1,31 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: quant-lab-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: quant_lab
+      POSTGRES_USER: quant_lab
+      POSTGRES_PASSWORD: quant_lab
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  grafana:
+    image: grafana/grafana:11.0.0
+    container_name: quant-lab-grafana
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+
+volumes:
+  postgres_data:
+  grafana_data:

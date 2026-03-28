@@ -1,0 +1,6 @@
+param()
+
+$ErrorActionPreference = "Stop"
+
+& "$PSScriptRoot\StartQuantLabChineseClient.ps1"
+exit $LASTEXITCODE
