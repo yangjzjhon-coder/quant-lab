@@ -23,6 +23,7 @@ from quant_lab.config import (
 )
 from quant_lab.providers.market_data import register_market_data_provider
 from quant_lab.service.database import AlertEvent, RuntimeSnapshot, ServiceHeartbeat, init_db, make_session_factory, session_scope
+from quant_lab.service.demo_runtime import build_runtime_dashboard_summary
 from quant_lab.service.monitor import build_service_app, run_monitor_cycle
 
 
@@ -148,6 +149,26 @@ def test_service_api_exposes_latest_runtime_snapshot(tmp_path: Path) -> None:
 
         missing_artifact = client.get("/artifacts/open/not_found.html")
         assert missing_artifact.status_code == 404
+
+
+def test_runtime_dashboard_summary_prefers_serialized_loop_status_label() -> None:
+    payload = build_runtime_dashboard_summary(
+        preflight={
+            "demo_trading": {"mode": "plan_only", "ready": False},
+            "alerts": {"channels": {}},
+            "okx_connectivity": {"notes": []},
+            "execution_loop": {
+                "latest_heartbeat": {
+                    "status": "warning",
+                    "status_label": "serialized-warning",
+                    "details": {"cycle": 7, "action": "open"},
+                }
+            },
+        }
+    )
+
+    assert payload["loop"]["value"] == "warning"
+    assert payload["loop"]["label"] == "serialized-warning"
 
 
 def test_service_api_exposes_market_data_and_integration_status(tmp_path: Path) -> None:

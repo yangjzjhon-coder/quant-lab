@@ -1445,7 +1445,7 @@ def build_demo_visuals_payload(
                 "submission_rate_pct": round((submitted_count / total_cycles) * 100, 2) if total_cycles else 0.0,
                 "last_cycle": last_point["cycle"] if last_point else None,
                 "last_status": last_point["status"] if last_point else None,
-                "last_status_label": autotrade_status_label(last_point["status"]) if last_point else "--",
+                "last_status_label": demo_history_status_label(last_point),
                 "last_event_time": last_point["created_at"] if last_point else None,
                 "last_submitted_at": last_submitted["created_at"] if last_submitted else None,
                 "last_error_at": last_error["created_at"] if last_error else None,
@@ -1503,7 +1503,7 @@ def build_demo_visuals_payload(
             "submission_rate_pct": round((submitted_count / total_cycles) * 100, 2) if total_cycles else 0.0,
             "last_cycle": last_point["cycle"] if last_point else None,
             "last_status": last_point["status"] if last_point else None,
-            "last_status_label": autotrade_status_label(last_point["status"]) if last_point else "--",
+            "last_status_label": demo_history_status_label(last_point),
             "last_event_time": last_point["created_at"] if last_point else None,
             "last_submitted_at": last_submitted["created_at"] if last_submitted else None,
             "last_error_at": last_error["created_at"] if last_error else None,
@@ -1669,6 +1669,11 @@ def build_client_headline_summary(
         or autotrade_status.get("latest_loop_status")
         or "missing"
     )
+    latest_loop_status_label = str(
+        autotrade_status.get("latest_loop_status_label")
+        or latest_heartbeat.get("status_label")
+        or autotrade_status_label(latest_loop_status)
+    )
     latest_event_time = latest_heartbeat.get("created_at") or (demo_visuals.get("summary") or {}).get("last_event_time")
     level = "ok" if can_submit and will_submit_now else "warn" if can_submit else "danger"
 
@@ -1711,7 +1716,7 @@ def build_client_headline_summary(
             "note": actionable_note,
         },
         "loop": {
-            "value": autotrade_status_label(latest_loop_status),
+            "value": latest_loop_status_label,
             "level": "danger" if latest_loop_status == "error" else "ok",
             "note": loop_note,
             "status": latest_loop_status,
@@ -2087,6 +2092,7 @@ def build_runtime_dashboard_summary(*, preflight: dict[str, Any]) -> dict[str, A
         if loop_status == "error"
         else str(demo.get("mode") or "plan_only")
     )
+    loop_status_label = str(loop_summary.get("status_label") or ui_code_label(loop_status))
     loop_mode = str(loop_summary.get("mode") or "single")
     demo_status_label = f"portfolio {demo_base_label}" if loop_mode == "portfolio" else demo_base_label
     demo_status_ok = bool(demo.get("ready")) or loop_status not in {"error", "missing"}
@@ -2104,7 +2110,7 @@ def build_runtime_dashboard_summary(*, preflight: dict[str, Any]) -> dict[str, A
         },
         "loop": {
             "value": loop_status,
-            "label": ui_code_label(loop_status),
+            "label": loop_status_label,
             "note": str(loop_summary.get("card_note") or "当前还没有演示执行循环心跳"),
             "mode": loop_mode,
         },
@@ -2216,6 +2222,7 @@ def _load_executor_state_path_info(
     if not path.exists():
         return {
             "status": "missing",
+            "status_label": ui_code_label("missing"),
             "path": str(path),
             "legacy_fallback_used": legacy_fallback_used,
             "mode": mode,
@@ -2867,6 +2874,7 @@ def _runtime_dashboard_loop_summary(latest_heartbeat: Any) -> dict[str, Any]:
         }
 
     status = str(heartbeat.get("status") or "missing")
+    status_label = str(heartbeat.get("status_label") or ui_code_label(status))
     details = normalize_demo_heartbeat_contract(heartbeat.get("details"), status=status)
     mode = str(details.get("mode") or "").strip().lower()
     summary = details.get("summary") if isinstance(details.get("summary"), dict) else {}
@@ -2879,6 +2887,7 @@ def _runtime_dashboard_loop_summary(latest_heartbeat: Any) -> dict[str, Any]:
         active_count = summary.get("active_position_symbol_count")
         return {
             "status": status,
+            "status_label": status_label,
             "mode": "portfolio",
             "card_note": (
                 f"循环 {cycle_label} | 组合 {symbol_count if symbol_count not in {None, ''} else '--'} 标的"
@@ -2892,6 +2901,7 @@ def _runtime_dashboard_loop_summary(latest_heartbeat: Any) -> dict[str, Any]:
     action = str(plan.get("action") or "n/a")
     return {
         "status": status,
+        "status_label": status_label,
         "mode": "single",
         "card_note": f"循环 {cycle_label} | {client_action_label(action)}",
         "status_note": "单标的执行循环心跳已连接。",
@@ -3017,6 +3027,15 @@ def _pick_blocked_hint(blocking_reasons: list[str]) -> str:
 
 def autotrade_status_label(status: str | None) -> str:
     return ui_code_label(status)
+
+
+def demo_history_status_label(point: dict[str, Any] | None) -> str:
+    if not point:
+        return "--"
+    label = point.get("status_label")
+    if isinstance(label, str) and label.strip():
+        return label
+    return autotrade_status_label(point.get("status"))
 
 def _coerce_float(value: Any) -> float | None:
     if value in {None, ""}:

@@ -152,3 +152,6 @@
 - 新增共享 `src/quant_lab/service/serialization.py`，下沉 UTC datetime 序列化 helper，并让 `demo_runtime / monitor / project_ops / research_ops` 复用同一实现，避免继续把时间语义绑在单一 runtime 模块里，同时规避 `demo_runtime <-> research_ops` 新循环依赖。
 - 为 research workflow service API 补齐 UTC 时间戳契约回归，覆盖 `task / candidate / evaluation_report / approval / overview` 输出，固定所有研究流程核心响应统一返回 `+00:00` 时间格式。
 - 继续收口 `monitor` 内剩余 `isoformat()` 直出点，让 monitor heartbeat 明细、report stale 告警文案、artifact catalog 的 `modified_at` 统一复用共享 UTC 序列化，并补齐对应 service monitor 回归断言。
+- 收口 `demo_visuals.summary.last_status_label` 的重复解释路径，让 demo 历史摘要优先消费 heartbeat history 已序列化的 `status_label`，只在缺失时回退到共享状态映射，并补齐对应 client visuals 回归测试。
+- 收口 `client headline` 对 loop 状态的重复翻译路径，让 `build_client_headline_summary(...)` 优先消费 `autotrade_status.latest_loop_status_label` / heartbeat 已序列化 `status_label`，避免 headline 再次本地翻译状态码。
+- 收口 `runtime dashboard summary` 对 loop 状态标签的本地重算，让 `_runtime_dashboard_loop_summary(...)` 直接携带 `status_label`，并让 `dashboard_summary.loop.label` 优先消费已序列化标签，而不是在 summary 层再次翻译状态码。

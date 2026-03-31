@@ -17,6 +17,7 @@ from quant_lab.service.demo_runtime import (
     build_client_warning_summary,
     build_demo_visuals_payload,
     client_side_label,
+    demo_history_status_label,
 )
 
 
@@ -32,6 +33,12 @@ def test_client_side_label_uses_shared_runtime_mapping() -> None:
     assert client_side_label(-1) == "做空"
     assert client_side_label(0) == "空仓"
     assert client_side_label(None) == "--"
+
+
+def test_demo_history_status_label_prefers_serialized_status_label() -> None:
+    assert demo_history_status_label({"status": "warning", "status_label": "serialized-warning"}) == "serialized-warning"
+    assert demo_history_status_label({"status": "warning"}) == autotrade_status_label("warning")
+    assert demo_history_status_label(None) == "--"
 
 
 def test_build_demo_visuals_payload_summarizes_demo_history(tmp_path: Path) -> None:
@@ -129,6 +136,63 @@ def test_build_demo_visuals_payload_summarizes_demo_history(tmp_path: Path) -> N
     assert payload["recent_events"][0]["current_side_label"] == "做空"
     assert payload["recent_events"][0]["desired_side_label"] == "做空"
     assert payload["recent_alerts"][0]["event_key"] == "demo_order_submitted"
+
+
+def test_build_demo_visuals_payload_summary_prefers_serialized_history_status_label(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    database_url = f"sqlite:///{(tmp_path / 'quant_lab.db').as_posix()}"
+    init_db(database_url)
+    session_factory = make_session_factory(database_url)
+
+    with session_scope(session_factory) as session:
+        session.add(
+            ServiceHeartbeat(
+                service_name="quant-lab-demo-loop",
+                status="error",
+                details={
+                    "cycle": 1,
+                    "action": "hold",
+                    "desired_side": 0,
+                    "current_side": 0,
+                    "target_contracts": 0.0,
+                    "current_contracts": 0.0,
+                    "submitted": False,
+                    "response_count": 0,
+                    "warning_count": 0,
+                    "latest_price": 71000.0,
+                },
+                created_at=_utc("2026-03-25T12:10:00+00:00"),
+            )
+        )
+
+    original = build_demo_visuals_payload.__globals__["_demo_visual_heartbeat_point"]
+
+    def _fake_demo_visual_heartbeat_point(row):
+        point = original(row)
+        point["status_label"] = "serialized-error"
+        return point
+
+    monkeypatch.setitem(
+        build_demo_visuals_payload.__globals__,
+        "_demo_visual_heartbeat_point",
+        _fake_demo_visual_heartbeat_point,
+    )
+
+    payload = build_demo_visuals_payload(
+        session_factory=session_factory,
+        reconcile={
+            "mode": "single",
+            "position": {"side": 0, "contracts": 0.0},
+            "plan": {"target_contracts": 0.0},
+            "signal": {"desired_side": 0},
+        },
+    )
+
+    assert payload["summary"]["last_status"] == "error"
+    assert payload["recent_events"][0]["status_label"] == "serialized-error"
+    assert payload["summary"]["last_status_label"] == "serialized-error"
 
 
 def test_build_client_snapshot_falls_back_to_cached_state_when_live_fetch_fails(
@@ -835,6 +899,7 @@ def test_build_headline_summary_reflects_autotrade_and_snapshot_state() -> None:
         autotrade_status={
             "headline": "自动下单被账户或交易所状态阻塞",
             "latest_loop_status": "warning",
+            "latest_loop_status_label": autotrade_status_label("warning"),
             "will_submit_now": False,
         },
         demo_visuals={"summary": {"last_event_time": "2026-03-27T12:00:00+00:00"}},
@@ -849,6 +914,32 @@ def test_build_headline_summary_reflects_autotrade_and_snapshot_state() -> None:
     assert payload["submit"]["value"] == "允许"
     assert payload["actionable"]["value"] == "无动作"
     assert payload["loop"]["value"] == "警告"
+
+
+def test_build_headline_summary_prefers_serialized_loop_status_label() -> None:
+    payload = build_client_headline_summary(
+        preflight={
+            "demo_trading": {"mode": "submit_ready", "ready": True},
+            "execution_loop": {
+                "latest_heartbeat": {
+                    "status": "warning",
+                    "status_label": "heartbeat-warning",
+                    "created_at": "2026-03-27T12:00:00+00:00",
+                }
+            },
+        },
+        autotrade_status={
+            "headline": "blocked",
+            "latest_loop_status": "warning",
+            "latest_loop_status_label": "serialized-warning",
+            "will_submit_now": False,
+        },
+        demo_visuals={"summary": {"last_event_time": "2026-03-27T12:00:00+00:00"}},
+        snapshot_source="cached_local_state",
+    )
+
+    assert payload["loop"]["status"] == "warning"
+    assert payload["loop"]["value"] == "serialized-warning"
 
 
 def test_build_checks_summary_for_single_mode() -> None:
