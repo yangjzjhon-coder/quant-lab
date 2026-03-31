@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import html as html_lib
 import json
 from contextlib import asynccontextmanager
 from io import StringIO
@@ -11,16 +12,45 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-import httpx
 import pandas as pd
 from pydantic import BaseModel
 from sqlalchemy import desc, select
 
 from quant_lab.alerts.delivery import deliver_alerts
+from quant_lab.errors import (
+    InvalidRequestError,
+    NotFoundError,
+    QuantLabError,
+    ServiceOperationError,
+    normalize_error,
+)
+from quant_lab.logging_utils import configure_logging, get_logger
+from quant_lab.application.project_tasks import resolve_project_research_results_path
+from quant_lab.artifacts import (
+    artifact_resolution_path,
+    primary_report_prefix as artifact_primary_report_prefix,
+    backtest_artifact_resolution as resolve_backtest_artifact_group,
+    resolve_artifact_open_path,
+    sleeve_report_prefix as artifact_sleeve_report_prefix,
+    sleeve_backtest_artifact_resolution as resolve_sleeve_backtest_artifact_group,
+    symbol_slug,
+    sweep_prefix as artifact_sweep_prefix,
+    sweep_artifact_resolution as resolve_sweep_artifact_group,
+)
 from quant_lab.config import AppConfig, configured_symbols
 from quant_lab.service.client_dashboard import render_client_dashboard
 from quant_lab.service.database import AlertEvent, ProjectTaskRun, RuntimeSnapshot, ServiceHeartbeat, session_scope
 from quant_lab.service.dashboard import render_runtime_dashboard
+from quant_lab.service.demo_runtime import (
+    build_preflight_payload as runtime_build_preflight_payload,
+    heartbeat_service_name,
+    resolve_proxy_egress_ip as runtime_resolve_proxy_egress_ip,
+    serialize_alert_event,
+    serialize_service_heartbeat,
+)
+from quant_lab.service.serialization import serialize_utc_datetime
+
+LOGGER = get_logger(__name__)
 
 
 @dataclass
@@ -122,8 +152,30 @@ class ResearchAIRunRequest(BaseModel):
     max_output_tokens: int | None = None
 
 
-_PROXY_EGRESS_IP_CACHE: dict[str, tuple[float, str | None]] = {}
-_PROXY_EGRESS_IP_TTL_SECONDS = 600.0
+class ResearchAgentRunRequest(BaseModel):
+    role: str = "research_lead"
+    task: str
+    title: str | None = None
+    hypothesis: str = ""
+    symbols: list[str] = []
+    context: dict[str, Any] = {}
+    task_id: int | None = None
+    create_task: bool = True
+    register_candidate: bool = True
+    owner_role: str = "research_lead"
+    author_role: str = "strategy_builder"
+    priority: str = "high"
+    notes: str = ""
+    candidate_name: str | None = None
+    strategy_name: str | None = None
+    variant: str | None = None
+    timeframe: str | None = None
+    thesis: str | None = None
+    tags: list[str] = []
+
+
+def _raise_api_error(exc: Exception) -> None:
+    raise normalize_error(exc) from exc
 
 
 def run_monitor_cycle(config: AppConfig, session_factory, project_root: Path) -> MonitorArtifacts:
@@ -162,7 +214,7 @@ def run_monitor_cycle(config: AppConfig, session_factory, project_root: Path) ->
                 "strategy_name": config.strategy.name,
                 "latest_equity": report_inputs.latest_equity,
                 "halted": report_inputs.halted,
-                "report_timestamp": report_inputs.report_timestamp.isoformat(),
+                "report_timestamp": serialize_utc_datetime(report_inputs.report_timestamp),
             },
         )
         session.add(heartbeat)
@@ -181,8 +233,19 @@ def run_monitor_cycle(config: AppConfig, session_factory, project_root: Path) ->
 
 
 def build_service_app(config: AppConfig, session_factory, project_root: Path):
-    from fastapi import FastAPI, HTTPException
-    from fastapi.responses import FileResponse, HTMLResponse
+    from fastapi import FastAPI, Request
+    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+
+    configure_logging(project_root=project_root.resolve())
+    no_cache_headers = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    }
+
+    def _apply_no_cache(response: HTMLResponse | FileResponse | JSONResponse):
+        response.headers.update(no_cache_headers)
+        return response
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -200,13 +263,56 @@ def build_service_app(config: AppConfig, session_factory, project_root: Path):
 
     app = FastAPI(title="quant-lab service", version="0.1.0", lifespan=lifespan)
 
+    @app.exception_handler(QuantLabError)
+    async def _handle_quant_lab_error(request: Request, exc: QuantLabError) -> JSONResponse:
+        LOGGER.warning(
+            "service api handled error method=%s path=%s code=%s status=%s detail=%s",
+            request.method,
+            request.url.path,
+            exc.error_code,
+            exc.status_code,
+            exc.detail,
+        )
+        return JSONResponse(status_code=exc.status_code, content=exc.to_payload())
+
+    @app.exception_handler(Exception)
+    async def _handle_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
+        LOGGER.exception(
+            "service api unexpected error method=%s path=%s",
+            request.method,
+            request.url.path,
+        )
+        payload = ServiceOperationError(
+            "Internal server error.",
+            error_code="internal_server_error",
+        ).to_payload()
+        return JSONResponse(status_code=500, content=payload)
+
     @app.get("/", response_class=HTMLResponse)
     def dashboard() -> HTMLResponse:
-        return render_runtime_dashboard(config)
+        artifacts = _artifact_payload_catalog(config=config, project_root=project_root)
+        visual_note, visual_html = _render_initial_visual_reports(artifacts)
+        sleeves_html = _render_initial_portfolio_sleeves(artifacts)
+        return _apply_no_cache(
+            render_runtime_dashboard(
+                config,
+                initial_visual_reports_note=visual_note,
+                initial_visual_reports_html=visual_html,
+                initial_portfolio_sleeves_html=sleeves_html,
+            )
+        )
 
     @app.get("/client", response_class=HTMLResponse)
     def client_dashboard() -> HTMLResponse:
-        return render_client_dashboard(config)
+        artifacts = _artifact_payload_catalog(config=config, project_root=project_root)
+        visual_note, visual_html = _render_initial_visual_reports(artifacts)
+        return _apply_no_cache(
+            render_client_dashboard(
+                config,
+                initial_visual_reports_note=visual_note,
+                initial_visual_reports_html=visual_html,
+            )
+        )
 
     @app.get("/health")
     def health() -> dict[str, Any]:
@@ -244,7 +350,7 @@ def build_service_app(config: AppConfig, session_factory, project_root: Path):
             items = session.execute(
                 select(AlertEvent).order_by(desc(AlertEvent.created_at)).limit(limit)
             ).scalars()
-            return {"alerts": [_alert_to_dict(item) for item in items]}
+            return {"alerts": [serialize_alert_event(item) for item in items]}
 
     @app.get("/heartbeats")
     def heartbeats(limit: int = 50) -> dict[str, Any]:
@@ -252,7 +358,7 @@ def build_service_app(config: AppConfig, session_factory, project_root: Path):
             items = session.execute(
                 select(ServiceHeartbeat).order_by(desc(ServiceHeartbeat.created_at)).limit(limit)
             ).scalars()
-            return {"heartbeats": [_heartbeat_to_dict(item) for item in items]}
+            return {"heartbeats": [serialize_service_heartbeat(item, include_status_label=True) for item in items]}
 
     @app.get("/project/tasks")
     def project_tasks(limit: int = 20) -> dict[str, Any]:
@@ -270,6 +376,18 @@ def build_service_app(config: AppConfig, session_factory, project_root: Path):
 
         return build_project_task_preflight(config=config, project_root=project_root)
 
+    @app.get("/market-data/status")
+    def market_data_status(probe: bool = False) -> dict[str, Any]:
+        from quant_lab.service.market_data import build_market_data_status
+
+        return build_market_data_status(config=config, probe=probe)
+
+    @app.get("/integrations/overview")
+    def integrations_overview(probe: bool = False) -> dict[str, Any]:
+        from quant_lab.service.integrations import build_integration_overview
+
+        return build_integration_overview(config=config, probe=probe)
+
     @app.get("/research/ai/status")
     def research_ai_status(probe: bool = False) -> dict[str, Any]:
         from quant_lab.service.research_ai import build_research_ai_status
@@ -278,8 +396,6 @@ def build_service_app(config: AppConfig, session_factory, project_root: Path):
 
     @app.post("/research/ai/run")
     def research_ai_run(payload: ResearchAIRunRequest) -> dict[str, Any]:
-        from fastapi import HTTPException
-
         from quant_lab.service.research_ai import ResearchAIRequest, run_research_ai_request
 
         try:
@@ -295,7 +411,46 @@ def build_service_app(config: AppConfig, session_factory, project_root: Path):
                 ),
             )
         except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {exc}") from exc
+            _raise_api_error(exc)
+
+    @app.get("/research/agent/status")
+    def research_agent_status(probe: bool = False) -> dict[str, Any]:
+        from quant_lab.service.research_agent import build_research_agent_status
+
+        return build_research_agent_status(config=config, probe=probe)
+
+    @app.post("/research/agent/run")
+    def research_agent_run(payload: ResearchAgentRunRequest) -> dict[str, Any]:
+        from quant_lab.service.research_agent import ResearchAgentRequest, run_research_agent_workflow
+
+        try:
+            return run_research_agent_workflow(
+                config=config,
+                session_factory=session_factory,
+                request=ResearchAgentRequest(
+                    role=payload.role,
+                    task=payload.task,
+                    title=payload.title,
+                    hypothesis=payload.hypothesis,
+                    symbols=payload.symbols,
+                    context=payload.context,
+                    task_id=payload.task_id,
+                    create_task=payload.create_task,
+                    register_candidate=payload.register_candidate,
+                    owner_role=payload.owner_role,
+                    author_role=payload.author_role,
+                    priority=payload.priority,
+                    notes=payload.notes,
+                    candidate_name=payload.candidate_name,
+                    strategy_name=payload.strategy_name,
+                    variant=payload.variant,
+                    timeframe=payload.timeframe,
+                    thesis=payload.thesis,
+                    tags=payload.tags,
+                ),
+            )
+        except Exception as exc:
+            _raise_api_error(exc)
 
     @app.get("/artifacts")
     def artifacts() -> dict[str, Any]:
@@ -305,30 +460,41 @@ def build_service_app(config: AppConfig, session_factory, project_root: Path):
     def artifact_open(file_name: str) -> FileResponse:
         storage = config.storage.resolved(project_root)
         report_dir = storage.report_dir.resolve()
-        candidate = (report_dir / Path(file_name).name).resolve()
+        candidate = resolve_artifact_open_path(report_dir, file_name)
+        if candidate is None:
+            raise NotFoundError("Artifact not found.", error_code="artifact_not_found")
         try:
             candidate.relative_to(report_dir)
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail="Artifact path is outside the reports directory.") from exc
+            raise InvalidRequestError(
+                "Artifact path is outside the reports directory.",
+                error_code="artifact_path_outside_reports_dir",
+            ) from exc
         if not candidate.exists() or not candidate.is_file():
-            raise HTTPException(status_code=404, detail="Artifact not found.")
-        return FileResponse(candidate)
+            raise NotFoundError("Artifact not found.", error_code="artifact_not_found")
+        return _apply_no_cache(FileResponse(candidate))
 
     @app.get("/reports/backtest")
     def report_backtest() -> FileResponse:
         payload = _artifact_payload_catalog(config=config, project_root=project_root)
         report = payload["backtest_report"]
         if not report["exists"]:
-            raise HTTPException(status_code=404, detail="Backtest dashboard not found.")
-        return FileResponse(report["path"], media_type="text/html; charset=utf-8")
+            raise NotFoundError(
+                "未找到回测报表页面。",
+                error_code="backtest_dashboard_not_found",
+            )
+        return _apply_no_cache(FileResponse(report["path"], media_type="text/html; charset=utf-8"))
 
     @app.get("/reports/sweep")
     def report_sweep() -> FileResponse:
         payload = _artifact_payload_catalog(config=config, project_root=project_root)
         report = payload["sweep_report"]
         if not report["exists"]:
-            raise HTTPException(status_code=404, detail="Sweep dashboard not found.")
-        return FileResponse(report["path"], media_type="text/html; charset=utf-8")
+            raise NotFoundError(
+                "Sweep dashboard not found.",
+                error_code="sweep_dashboard_not_found",
+            )
+        return _apply_no_cache(FileResponse(report["path"], media_type="text/html; charset=utf-8"))
 
     @app.post("/monitor/run")
     def monitor_run() -> dict[str, Any]:
@@ -352,8 +518,6 @@ def build_service_app(config: AppConfig, session_factory, project_root: Path):
 
     @app.post("/client/align-leverage")
     def client_align_leverage(payload: AlignLeverageRequest) -> dict[str, Any]:
-        from fastapi import HTTPException
-
         from quant_lab.service.client_ops import run_client_align_leverage
 
         try:
@@ -366,12 +530,10 @@ def build_service_app(config: AppConfig, session_factory, project_root: Path):
                 rearm_protective_stop=payload.rearm_protective_stop,
             )
         except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {exc}") from exc
+            _raise_api_error(exc)
 
     @app.post("/client/alert-test")
     def client_alert_test(payload: AlertTestRequest) -> dict[str, Any]:
-        from fastapi import HTTPException
-
         from quant_lab.service.client_ops import run_client_alert_test
 
         try:
@@ -381,12 +543,10 @@ def build_service_app(config: AppConfig, session_factory, project_root: Path):
                 message=payload.message,
             )
         except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {exc}") from exc
+            _raise_api_error(exc)
 
     @app.post("/project/run")
     def project_run(payload: ProjectTaskRequest) -> dict[str, Any]:
-        from fastapi import HTTPException
-
         from quant_lab.service.project_ops import execute_project_task, serialize_project_task_run
 
         try:
@@ -397,7 +557,7 @@ def build_service_app(config: AppConfig, session_factory, project_root: Path):
                 task=payload.task,
             )
         except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {exc}") from exc
+            _raise_api_error(exc)
         return {
             "task_run": serialize_project_task_run(run),
             "result": result,
@@ -406,8 +566,6 @@ def build_service_app(config: AppConfig, session_factory, project_root: Path):
 
     @app.post("/project/submit")
     def project_submit(payload: ProjectTaskRequest) -> dict[str, Any]:
-        from fastapi import HTTPException
-
         from quant_lab.service.project_ops import serialize_project_task_run, submit_project_task
 
         try:
@@ -418,7 +576,7 @@ def build_service_app(config: AppConfig, session_factory, project_root: Path):
                 task=payload.task,
             )
         except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {exc}") from exc
+            _raise_api_error(exc)
         return {"task_run": serialize_project_task_run(run)}
 
     @app.get("/research/overview")
@@ -440,8 +598,6 @@ def build_service_app(config: AppConfig, session_factory, project_root: Path):
 
     @app.post("/research/tasks")
     def research_task_create(payload: ResearchTaskCreateRequest) -> dict[str, Any]:
-        from fastapi import HTTPException
-
         from quant_lab.service.research_ops import create_research_task, serialize_research_task
 
         try:
@@ -455,7 +611,7 @@ def build_service_app(config: AppConfig, session_factory, project_root: Path):
                 notes=payload.notes,
             )
         except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {exc}") from exc
+            _raise_api_error(exc)
         return {"task": serialize_research_task(task)}
 
     @app.get("/research/candidates")
@@ -480,8 +636,6 @@ def build_service_app(config: AppConfig, session_factory, project_root: Path):
 
     @app.post("/research/candidates")
     def research_candidate_create(payload: StrategyCandidateCreateRequest) -> dict[str, Any]:
-        from fastapi import HTTPException
-
         from quant_lab.service.research_ops import register_strategy_candidate, serialize_strategy_candidate
 
         try:
@@ -500,13 +654,11 @@ def build_service_app(config: AppConfig, session_factory, project_root: Path):
                 details=payload.details,
             )
         except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {exc}") from exc
+            _raise_api_error(exc)
         return {"candidate": serialize_strategy_candidate(candidate)}
 
     @app.post("/research/candidates/{candidate_id}/evaluate")
     def research_candidate_evaluate(candidate_id: int, payload: CandidateEvaluateRequest) -> dict[str, Any]:
-        from fastapi import HTTPException
-
         from quant_lab.service.research_ops import (
             evaluate_strategy_candidate,
             infer_candidate_artifacts,
@@ -540,9 +692,10 @@ def build_service_app(config: AppConfig, session_factory, project_root: Path):
                 trades_path=trades_path if trades_path.exists() else None,
                 equity_curve_path=equity_curve_path if equity_curve_path.exists() else None,
                 notes=payload.notes,
+                artifact_payload_source=inferred,
             )
         except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {exc}") from exc
+            _raise_api_error(exc)
         return {
             "candidate": serialize_strategy_candidate(candidate),
             "evaluation_report": serialize_evaluation_report(report),
@@ -550,8 +703,6 @@ def build_service_app(config: AppConfig, session_factory, project_root: Path):
 
     @app.post("/research/candidates/{candidate_id}/approve")
     def research_candidate_approve(candidate_id: int, payload: CandidateApprovalRequest) -> dict[str, Any]:
-        from fastapi import HTTPException
-
         from quant_lab.service.research_ops import (
             approve_strategy_candidate,
             serialize_approval_decision,
@@ -568,7 +719,7 @@ def build_service_app(config: AppConfig, session_factory, project_root: Path):
                 reason=payload.reason,
             )
         except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {exc}") from exc
+            _raise_api_error(exc)
         return {
             "candidate": serialize_strategy_candidate(candidate),
             "approval": serialize_approval_decision(approval),
@@ -576,8 +727,6 @@ def build_service_app(config: AppConfig, session_factory, project_root: Path):
 
     @app.post("/research/candidates/{candidate_id}/backtest")
     def research_candidate_backtest(candidate_id: int, payload: ResearchBacktestCandidateRequest) -> dict[str, Any]:
-        from fastapi import HTTPException
-
         from quant_lab.service.research_ops import backtest_strategy_candidate, evaluate_backtested_candidate
 
         try:
@@ -598,22 +747,22 @@ def build_service_app(config: AppConfig, session_factory, project_root: Path):
                 build_report=payload.build_report,
             )
         except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {exc}") from exc
+            _raise_api_error(exc)
 
     @app.post("/research/materialize-top")
     def research_materialize_top(payload: ResearchMaterializeRequest) -> dict[str, Any]:
-        from fastapi import HTTPException
-
         from quant_lab.service.research_ops import materialize_trend_research_candidates
 
-        storage = config.storage.resolved(project_root.resolve())
-        symbol_slug = config.instrument.symbol.replace("/", "-")
-        inferred_path = storage.report_dir / f"{symbol_slug}_{config.strategy.name}_trend_research.csv"
-        resolved_results_path = Path(payload.results_path).expanduser() if payload.results_path else inferred_path
-        if not resolved_results_path.is_absolute():
-            resolved_results_path = (project_root / resolved_results_path).resolve()
+        resolved_results_path = resolve_project_research_results_path(
+            config=config,
+            project_root=project_root,
+            results_path=Path(payload.results_path) if payload.results_path else None,
+        )
         if not resolved_results_path.exists():
-            raise HTTPException(status_code=404, detail=f"Trend research CSV not found: {resolved_results_path}")
+            raise NotFoundError(
+                f"Trend research CSV not found: {resolved_results_path}",
+                error_code="trend_research_csv_not_found",
+            )
 
         try:
             results = pd.read_csv(resolved_results_path)
@@ -632,22 +781,22 @@ def build_service_app(config: AppConfig, session_factory, project_root: Path):
                 notes=payload.notes,
             )
         except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {exc}") from exc
+            _raise_api_error(exc)
 
     @app.post("/research/promote-top")
     def research_promote_top(payload: ResearchPromoteRequest) -> dict[str, Any]:
-        from fastapi import HTTPException
-
         from quant_lab.service.research_ops import promote_trend_research_candidates
 
-        storage = config.storage.resolved(project_root.resolve())
-        symbol_slug = config.instrument.symbol.replace("/", "-")
-        inferred_path = storage.report_dir / f"{symbol_slug}_{config.strategy.name}_trend_research.csv"
-        resolved_results_path = Path(payload.results_path).expanduser() if payload.results_path else inferred_path
-        if not resolved_results_path.is_absolute():
-            resolved_results_path = (project_root / resolved_results_path).resolve()
+        resolved_results_path = resolve_project_research_results_path(
+            config=config,
+            project_root=project_root,
+            results_path=Path(payload.results_path) if payload.results_path else None,
+        )
         if not resolved_results_path.exists():
-            raise HTTPException(status_code=404, detail=f"Trend research CSV not found: {resolved_results_path}")
+            raise NotFoundError(
+                f"Trend research CSV not found: {resolved_results_path}",
+                error_code="trend_research_csv_not_found",
+            )
 
         try:
             results = pd.read_csv(resolved_results_path)
@@ -668,7 +817,7 @@ def build_service_app(config: AppConfig, session_factory, project_root: Path):
                 build_report=payload.build_report,
             )
         except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {exc}") from exc
+            _raise_api_error(exc)
 
     return app
 
@@ -740,7 +889,7 @@ def _maybe_send_state_change_alerts(
                 f"*Report stale*\n"
                 f"Symbol: `{config.instrument.symbol}`\n"
                 f"Strategy: `{config.strategy.name}`\n"
-                f"Latest report timestamp: `{current_snapshot.report_timestamp.isoformat()}`"
+                f"Latest report timestamp: `{serialize_utc_datetime(current_snapshot.report_timestamp)}`"
             ),
         ):
             sent.append("report_stale")
@@ -787,10 +936,17 @@ class _ReportState:
 
 
 def _load_report_state(config: AppConfig, project_root: Path) -> _ReportState:
-    storage = config.storage.resolved(project_root)
-    report_prefix = _primary_report_prefix(config)
-    summary_path = storage.report_dir / f"{report_prefix}_summary.json"
-    equity_path = storage.report_dir / f"{report_prefix}_equity_curve.csv"
+    resolution = _backtest_artifact_resolution(config=config, project_root=project_root)
+    summary_path = _artifact_resolution_path(
+        resolution,
+        "summary",
+        config.storage.resolved(project_root).report_dir / f"{artifact_primary_report_prefix(config)}_summary.json",
+    )
+    equity_path = _artifact_resolution_path(
+        resolution,
+        "equity_curve",
+        config.storage.resolved(project_root).report_dir / f"{artifact_primary_report_prefix(config)}_equity_curve.csv",
+    )
 
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     latest = _read_last_equity_row(equity_path)
@@ -848,12 +1004,38 @@ def _parse_bool(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y"}
 
 
+def _backtest_artifact_resolution(config: AppConfig, project_root: Path) -> dict[str, Any]:
+    _, resolution = resolve_backtest_artifact_group(config=config, project_root=project_root)
+    return resolution
+
+
+def _sleeve_artifact_resolution(
+    *,
+    config: AppConfig,
+    project_root: Path,
+    portfolio_symbols: list[str],
+    symbol: str,
+) -> dict[str, Any]:
+    _, resolution = resolve_sleeve_backtest_artifact_group(
+        config=config,
+        project_root=project_root,
+        portfolio_symbols=portfolio_symbols,
+        symbol=symbol,
+    )
+    return resolution
+
+
+def _sweep_artifact_resolution(config: AppConfig, project_root: Path) -> dict[str, Any]:
+    _, resolution = resolve_sweep_artifact_group(config=config, project_root=project_root)
+    return resolution
+
+
 def _snapshot_to_dict(snapshot: RuntimeSnapshot) -> dict[str, Any]:
     return {
         "id": snapshot.id,
         "symbol": snapshot.symbol,
         "strategy_name": snapshot.strategy_name,
-        "report_timestamp": _serialize_datetime(snapshot.report_timestamp),
+        "report_timestamp": serialize_utc_datetime(snapshot.report_timestamp),
         "report_stale": bool(snapshot.report_stale),
         "halted": bool(snapshot.halted),
         "latest_equity": snapshot.latest_equity,
@@ -863,40 +1045,8 @@ def _snapshot_to_dict(snapshot: RuntimeSnapshot) -> dict[str, Any]:
         "max_drawdown_pct": snapshot.max_drawdown_pct,
         "trade_count": snapshot.trade_count,
         "summary": snapshot.summary,
-        "created_at": _serialize_datetime(snapshot.created_at),
+        "created_at": serialize_utc_datetime(snapshot.created_at),
     }
-
-
-def _alert_to_dict(alert: AlertEvent) -> dict[str, Any]:
-    return {
-        "id": alert.id,
-        "event_key": alert.event_key,
-        "channel": alert.channel,
-        "level": alert.level,
-        "title": alert.title,
-        "message": alert.message,
-        "status": alert.status,
-        "delivered_at": _serialize_datetime(alert.delivered_at),
-        "created_at": _serialize_datetime(alert.created_at),
-    }
-
-
-def _heartbeat_to_dict(heartbeat: ServiceHeartbeat) -> dict[str, Any]:
-    return {
-        "id": heartbeat.id,
-        "service_name": heartbeat.service_name,
-        "status": heartbeat.status,
-        "details": heartbeat.details,
-        "created_at": _serialize_datetime(heartbeat.created_at),
-    }
-
-
-def _serialize_datetime(value: datetime | None) -> str | None:
-    if value is None:
-        return None
-    if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc).isoformat()
 
 
 def _artifact_payload_legacy(config: AppConfig, project_root: Path) -> dict[str, Any]:
@@ -906,29 +1056,29 @@ def _artifact_payload_legacy(config: AppConfig, project_root: Path) -> dict[str,
     report_dir = storage.report_dir
     return {
         "backtest_report": _artifact_meta(
-            label="回测 HTML 报表",
+            label="回测网页报表",
             path=report_dir / f"{report_prefix}_dashboard.html",
             url="/reports/backtest",
         ),
         "sweep_report": _artifact_meta(
-            label="参数扫描 HTML 报表",
+            label="参数扫描网页报表",
             path=report_dir / f"{report_prefix}_sweep_dashboard.html",
             url="/reports/sweep",
         ),
         "summary": _artifact_meta(
-            label="回测汇总 JSON",
+            label="回测摘要文件",
             path=report_dir / f"{report_prefix}_summary.json",
         ),
         "equity_curve": _artifact_meta(
-            label="净值曲线 CSV",
+            label="净值曲线",
             path=report_dir / f"{report_prefix}_equity_curve.csv",
         ),
         "trades": _artifact_meta(
-            label="成交明细 CSV",
+            label="成交明细",
             path=report_dir / f"{report_prefix}_trades.csv",
         ),
         "sweep_csv": _artifact_meta(
-            label="参数扫描 CSV",
+            label="参数扫描结果表",
             path=report_dir / f"{report_prefix}_sweep.csv",
         ),
     }
@@ -957,6 +1107,27 @@ def _safe_json_payload(path: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _artifact_resolution_path(resolution: dict[str, Any], key: str, fallback: Path) -> Path:
+    return artifact_resolution_path(resolution, key, fallback)
+
+
+def _artifact_meta_from_resolution(
+    *,
+    label: str,
+    key: str,
+    resolution: dict[str, Any],
+    fallback: Path,
+    url: str | None = None,
+) -> dict[str, Any]:
+    path = _artifact_resolution_path(resolution, key, fallback)
+    payload = _artifact_meta(label=label, path=path, url=url)
+    payload["resolved_via"] = resolution.get("resolved_via")
+    payload["logical_prefix"] = resolution.get("logical_prefix")
+    payload["artifact_fingerprint"] = resolution.get("artifact_fingerprint")
+    payload["canonical_path"] = str(path)
+    return payload
+
+
 def _summary_metrics(summary: dict[str, Any]) -> dict[str, Any]:
     return {
         "initial_equity": summary.get("initial_equity"),
@@ -970,41 +1141,60 @@ def _summary_metrics(summary: dict[str, Any]) -> dict[str, Any]:
         "sharpe": summary.get("sharpe"),
         "capital_allocation_pct": summary.get("capital_allocation_pct"),
         "symbol_count": summary.get("symbol_count"),
+        "allocation_mode": summary.get("allocation_mode"),
+        "portfolio_construction": summary.get("portfolio_construction"),
+        "runtime_allocation_reference": summary.get("runtime_allocation_reference"),
+        "historical_allocation_overlay": summary.get("historical_allocation_overlay"),
+        "historical_allocated_risk_pct_avg": summary.get("historical_allocated_risk_pct_avg"),
     }
 
 
 def _sleeve_report_payloads(config: AppConfig, report_dir: Path, symbols: list[str]) -> list[dict[str, Any]]:
     sleeves: list[dict[str, Any]] = []
     for symbol in symbols:
-        prefix = f"{symbol.replace('/', '-')}_{config.strategy.name}_sleeve"
-        summary_path = report_dir / f"{prefix}_summary.json"
-        dashboard_path = report_dir / f"{prefix}_dashboard.html"
-        equity_path = report_dir / f"{prefix}_equity_curve.csv"
-        trades_path = report_dir / f"{prefix}_trades.csv"
+        resolution = _sleeve_artifact_resolution(
+            config=config,
+            project_root=report_dir.parent.parent,
+            portfolio_symbols=symbols,
+            symbol=symbol,
+        )
+        prefix = artifact_sleeve_report_prefix(symbol, config.strategy.name)
+        summary_path = _artifact_resolution_path(resolution, "summary", report_dir / f"{prefix}_summary.json")
+        dashboard_path = _artifact_resolution_path(resolution, "dashboard", report_dir / f"{prefix}_dashboard.html")
+        equity_path = _artifact_resolution_path(resolution, "equity_curve", report_dir / f"{prefix}_equity_curve.csv")
+        trades_path = _artifact_resolution_path(resolution, "trades", report_dir / f"{prefix}_trades.csv")
         summary = _safe_json_payload(summary_path)
         sleeves.append(
             {
                 "symbol": symbol,
-                "label": f"{symbol} Sleeve",
+                "label": f"{symbol} 子报表",
                 "metrics": _summary_metrics(summary),
-                "dashboard": _artifact_meta(
-                    label="Sleeve HTML",
-                    path=dashboard_path,
+                "dashboard": _artifact_meta_from_resolution(
+                    label="子报表页面",
+                    key="dashboard",
+                    resolution=resolution,
+                    fallback=report_dir / f"{prefix}_dashboard.html",
                     url=_artifact_open_url(dashboard_path),
                 ),
-                "summary_file": _artifact_meta(
-                    label="Sleeve Summary JSON",
-                    path=summary_path,
+                "summary_file": _artifact_meta_from_resolution(
+                    label="子报表摘要",
+                    key="summary",
+                    resolution=resolution,
+                    fallback=report_dir / f"{prefix}_summary.json",
                     url=_artifact_open_url(summary_path),
                 ),
-                "equity_curve": _artifact_meta(
-                    label="Sleeve Equity Curve CSV",
-                    path=equity_path,
+                "equity_curve": _artifact_meta_from_resolution(
+                    label="子报表权益曲线",
+                    key="equity_curve",
+                    resolution=resolution,
+                    fallback=report_dir / f"{prefix}_equity_curve.csv",
                     url=_artifact_open_url(equity_path),
                 ),
-                "trades": _artifact_meta(
-                    label="Sleeve Trades CSV",
-                    path=trades_path,
+                "trades": _artifact_meta_from_resolution(
+                    label="子报表成交明细",
+                    key="trades",
+                    resolution=resolution,
+                    fallback=report_dir / f"{prefix}_trades.csv",
                     url=_artifact_open_url(trades_path),
                 ),
             }
@@ -1021,6 +1211,8 @@ def _artifact_catalog(report_dir: Path, limit: int = 60) -> list[dict[str, Any]]
     for path in sorted(report_dir.iterdir(), key=lambda item: item.stat().st_mtime, reverse=True):
         if not path.is_file() or path.suffix.lower() not in allowed_suffixes:
             continue
+        if path.name.endswith("_latest.json"):
+            continue
         stat = path.stat()
         items.append(
             {
@@ -1032,7 +1224,7 @@ def _artifact_catalog(report_dir: Path, limit: int = 60) -> list[dict[str, Any]]
                 "category": _artifact_category(path),
                 "group_label": _artifact_group_label(path),
                 "size_bytes": stat.st_size,
-                "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+                "modified_at": serialize_utc_datetime(datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)),
             }
         )
         if len(items) >= limit:
@@ -1070,59 +1262,73 @@ def _artifact_category(path: Path) -> str:
 
 def _artifact_group_label(path: Path) -> str:
     mapping = {
-        "backtest_dashboard": "Backtest HTML",
-        "portfolio_dashboard": "Portfolio HTML",
-        "research_dashboard": "Research HTML",
-        "sweep_dashboard": "Sweep HTML",
-        "summary_json": "Summary JSON",
-        "trades_csv": "Trades CSV",
-        "sweep_csv": "Sweep CSV",
-        "research_csv": "Research CSV",
-        "spreadsheet": "Excel",
-        "notes": "Notes",
-        "csv": "CSV",
-        "json": "JSON",
+        "backtest_dashboard": "回测网页报表",
+        "portfolio_dashboard": "组合网页报表",
+        "research_dashboard": "研究网页报表",
+        "sweep_dashboard": "参数扫描网页报表",
+        "summary_json": "摘要文件",
+        "trades_csv": "成交明细表",
+        "sweep_csv": "参数扫描结果表",
+        "research_csv": "研究结果表",
+        "spreadsheet": "电子表格",
+        "notes": "说明文档",
+        "csv": "数据表",
+        "json": "数据文件",
     }
-    return mapping.get(_artifact_category(path), "Artifact")
+    return mapping.get(_artifact_category(path), "产物")
 
 
 def _artifact_payload_catalog(config: AppConfig, project_root: Path) -> dict[str, Any]:
     storage = config.storage.resolved(project_root)
-    report_prefix = _primary_report_prefix(config)
-    sweep_prefix = _primary_sweep_prefix(config)
     report_dir = storage.report_dir
     symbols = configured_symbols(config)
     portfolio_mode = len(symbols) > 1
-    summary_path = report_dir / f"{report_prefix}_summary.json"
+    backtest_resolution = _backtest_artifact_resolution(config=config, project_root=project_root)
+    sweep_resolution = _sweep_artifact_resolution(config=config, project_root=project_root)
+    report_prefix = artifact_primary_report_prefix(config)
+    sweep_report_prefix = artifact_sweep_prefix(config)
+    summary_path = _artifact_resolution_path(backtest_resolution, "summary", report_dir / f"{report_prefix}_summary.json")
     sleeve_reports = _sleeve_report_payloads(config, report_dir, symbols) if portfolio_mode else []
     return {
         "mode": "portfolio" if portfolio_mode else "single",
         "symbols": symbols,
-        "backtest_report": _artifact_meta(
-            label="Portfolio HTML" if portfolio_mode else "Backtest HTML",
-            path=report_dir / f"{report_prefix}_dashboard.html",
+        "backtest_report": _artifact_meta_from_resolution(
+            label="组合网页报表" if portfolio_mode else "回测网页报表",
+            key="dashboard",
+            resolution=backtest_resolution,
+            fallback=report_dir / f"{report_prefix}_dashboard.html",
             url="/reports/backtest",
         ),
-        "sweep_report": _artifact_meta(
-            label="Sweep HTML",
-            path=report_dir / f"{sweep_prefix}_sweep_dashboard.html",
+        "sweep_report": _artifact_meta_from_resolution(
+            label="参数扫描网页报表",
+            key="dashboard",
+            resolution=sweep_resolution,
+            fallback=report_dir / f"{sweep_report_prefix}_sweep_dashboard.html",
             url="/reports/sweep",
         ),
-        "summary": _artifact_meta(
-            label="Portfolio Summary JSON" if portfolio_mode else "Summary JSON",
-            path=summary_path,
+        "summary": _artifact_meta_from_resolution(
+            label="组合摘要文件" if portfolio_mode else "摘要文件",
+            key="summary",
+            resolution=backtest_resolution,
+            fallback=report_dir / f"{report_prefix}_summary.json",
         ),
-        "equity_curve": _artifact_meta(
-            label="Portfolio Equity Curve CSV" if portfolio_mode else "Equity Curve CSV",
-            path=report_dir / f"{report_prefix}_equity_curve.csv",
+        "equity_curve": _artifact_meta_from_resolution(
+            label="组合权益曲线" if portfolio_mode else "权益曲线",
+            key="equity_curve",
+            resolution=backtest_resolution,
+            fallback=report_dir / f"{report_prefix}_equity_curve.csv",
         ),
-        "trades": _artifact_meta(
-            label="Portfolio Trades CSV" if portfolio_mode else "Trades CSV",
-            path=report_dir / f"{report_prefix}_trades.csv",
+        "trades": _artifact_meta_from_resolution(
+            label="组合成交明细" if portfolio_mode else "成交明细",
+            key="trades",
+            resolution=backtest_resolution,
+            fallback=report_dir / f"{report_prefix}_trades.csv",
         ),
-        "sweep_csv": _artifact_meta(
-            label="Sweep CSV",
-            path=report_dir / f"{sweep_prefix}_sweep.csv",
+        "sweep_csv": _artifact_meta_from_resolution(
+            label="参数扫描结果表",
+            key="sweep_csv",
+            resolution=sweep_resolution,
+            fallback=report_dir / f"{sweep_report_prefix}_sweep.csv",
         ),
         "summary_metrics": _summary_metrics(_safe_json_payload(summary_path)),
         "sleeve_reports": sleeve_reports,
@@ -1130,226 +1336,174 @@ def _artifact_payload_catalog(config: AppConfig, project_root: Path) -> dict[str
     }
 
 
-def _primary_report_prefix(config: AppConfig) -> str:
-    symbols = configured_symbols(config)
-    if len(symbols) == 1:
-        return f"{symbols[0].replace('/', '-')}_{config.strategy.name}"
-    base_assets = "_".join(symbol.split("-")[0].lower() for symbol in symbols)
-    return f"portfolio_{base_assets}_{config.strategy.name}"
+def _collect_visual_report_cards(payload: dict[str, Any]) -> list[dict[str, str]]:
+    seen: set[str] = set()
+    cards: list[dict[str, str]] = []
+    preferred = {"backtest_dashboard", "portfolio_dashboard", "sweep_dashboard"}
+
+    def push(item: dict[str, Any] | None, *, default_label: str | None = None, default_kind: str | None = None) -> None:
+        if not isinstance(item, dict):
+            return
+        if not item.get("exists") or not item.get("url"):
+            return
+        path = str(item.get("path") or "")
+        if path and path in seen:
+            return
+        if path:
+            seen.add(path)
+        cards.append(
+            {
+                "label": str(item.get("label") or default_label or "网页报表"),
+                "kind": str(item.get("kind") or default_kind or "回测报表"),
+                "path": path,
+                "url": str(item.get("url") or ""),
+            }
+        )
+
+    def push_backtest() -> None:
+        report = payload.get("backtest_report") if isinstance(payload.get("backtest_report"), dict) else None
+        if report is None:
+            return
+        push(
+            {
+                **report,
+                "label": "当前组合总览" if payload.get("mode") == "portfolio" else "当前主回测",
+                "kind": "主报表",
+            }
+        )
+
+    def push_sleeves() -> None:
+        for item in payload.get("sleeve_reports") or []:
+            if not isinstance(item, dict):
+                continue
+            dashboard = item.get("dashboard") if isinstance(item.get("dashboard"), dict) else None
+            if dashboard is None:
+                continue
+            push(
+                {
+                    **dashboard,
+                    "label": f"{item.get('symbol') or '标的'} 子报表",
+                    "kind": "组合子报表",
+                }
+            )
+
+    if payload.get("mode") == "portfolio":
+        push_sleeves()
+        push_backtest()
+    else:
+        push_backtest()
+        push_sleeves()
+
+    catalog = payload.get("catalog") if isinstance(payload.get("catalog"), list) else []
+    dashboard_items = [
+        entry
+        for entry in catalog
+        if isinstance(entry, dict) and "dashboard" in str(entry.get("category") or "") and entry.get("url")
+    ]
+    for item in sorted(
+        dashboard_items,
+        key=lambda entry: (
+            -2 if "multi_cycle" in str(entry.get("name") or "") else 0,
+            -1 if str(entry.get("category") or "") in preferred else 0,
+            str(entry.get("name") or ""),
+        ),
+    )[:10]:
+        push(
+            {
+                **item,
+                "label": str(item.get("group_label") or item.get("label") or item.get("name") or "网页报表"),
+                "kind": str(item.get("name") or "最近产物"),
+            }
+        )
+
+    return cards
 
 
-def _primary_sweep_prefix(config: AppConfig) -> str:
-    return f"{config.instrument.symbol.replace('/', '-')}_{config.strategy.name}"
+def _render_initial_visual_reports(payload: dict[str, Any]) -> tuple[str, str]:
+    cards = _collect_visual_report_cards(payload)
+    if not cards:
+        return (
+            "当前还没有可嵌入的网页回测报表，请先运行回测或生成报表任务。",
+            '<div class="empty">还没有可视化回测预览。</div>',
+        )
+
+    html_parts: list[str] = []
+    for index, item in enumerate(cards):
+        card_class = "report-card primary" if index == 0 else "report-card"
+        kind = "多周期回测" if "multi_cycle" in item["kind"] else item["kind"]
+        url = f'{item["url"]}{"&" if "?" in item["url"] else "?"}_ts=boot'
+        html_parts.append(
+            f"""<article class="{card_class}">
+      <div class="report-head">
+        <div>
+          <strong>{html_lib.escape(item["label"])}</strong>
+          <div class="hint">{html_lib.escape(kind)}</div>
+          <div class="hint">{html_lib.escape(item["path"] or "--")}</div>
+        </div>
+        <div class="report-tags">
+          <span class="tag">K 线回放</span>
+          <span class="tag">开平仓标记</span>
+          <span class="tag warn">止损线</span>
+        </div>
+      </div>
+      <div class="report-preview">
+        <iframe src="{html_lib.escape(url, quote=True)}" loading="lazy" referrerpolicy="no-referrer"></iframe>
+      </div>
+      <a href="{html_lib.escape(url, quote=True)}" target="_blank" rel="noreferrer">新窗口打开</a>
+    </article>"""
+        )
+
+    return (
+        "主报表置顶显示，便于直接查看 K 线回放、交易标记与止损线。",
+        "".join(html_parts),
+    )
+
+
+def _render_initial_portfolio_sleeves(payload: dict[str, Any]) -> str:
+    sleeves = payload.get("sleeve_reports") if isinstance(payload.get("sleeve_reports"), list) else []
+    if not sleeves:
+        return '<div class="empty">当前没有可展示的组合子报表。</div>'
+
+    html_parts: list[str] = []
+    for item in sleeves:
+        if not isinstance(item, dict):
+            continue
+        metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else {}
+        metrics_lines: list[str] = []
+        if metrics.get("final_equity") is not None:
+            metrics_lines.append(f"最终权益：{float(metrics['final_equity']):,.2f}")
+        if metrics.get("total_return_pct") is not None:
+            metrics_lines.append(f"总收益：{float(metrics['total_return_pct']):.2f}%")
+        if metrics.get("max_drawdown_pct") is not None:
+            metrics_lines.append(f"最大回撤：{float(metrics['max_drawdown_pct']):.2f}%")
+        if metrics.get("trade_count") is not None:
+            metrics_lines.append(f"交易笔数：{int(float(metrics['trade_count']))}")
+        metrics_text = " | ".join(metrics_lines) if metrics_lines else json.dumps(metrics, ensure_ascii=False)
+        dashboard = item.get("dashboard") if isinstance(item.get("dashboard"), dict) else {}
+        url = str(dashboard.get("url") or "").strip()
+        link = (
+            f'<a href="{html_lib.escape(url, quote=True)}" target="_blank" rel="noreferrer">打开子报表</a>'
+            if url
+            else "暂无报表"
+        )
+        html_parts.append(
+            f"""<div class="feed-item">
+      <strong>{html_lib.escape(str(item.get("symbol") or "标的"))}</strong>
+      <div>{html_lib.escape(metrics_text)}</div>
+      <div class="note">{link}</div>
+    </div>"""
+        )
+    return "".join(html_parts) if html_parts else '<div class="empty">当前没有可展示的组合子报表。</div>'
 
 
 def build_preflight_payload(config: AppConfig, session_factory, project_root: Path) -> dict[str, Any]:
-    from quant_lab.execution.strategy_router import build_strategy_router_status
-    from quant_lab.service.research_ops import resolve_execution_approval
-
-    latest_demo_heartbeat = None
-    with session_scope(session_factory) as session:
-        latest_demo_heartbeat = session.execute(
-            select(ServiceHeartbeat)
-            .where(ServiceHeartbeat.service_name == "quant-lab-demo-loop")
-            .order_by(desc(ServiceHeartbeat.created_at))
-            .limit(1)
-        ).scalar_one_or_none()
-
-    executor_state = _load_executor_state(config=config, project_root=project_root)
-    executor_state = _normalize_executor_state_payload(
-        executor_state=executor_state,
-        latest_demo_heartbeat=latest_demo_heartbeat,
-    )
-    execution_approval = resolve_execution_approval(
-        session_factory=session_factory,
+    return runtime_build_preflight_payload(
         config=config,
-        required_scope="demo",
-    )
-    strategy_router = build_strategy_router_status(
         session_factory=session_factory,
-        config=config,
-        required_scope="demo",
+        project_root=project_root,
+        resolve_proxy_egress_ip_fn=_resolve_proxy_egress_ip,
     )
-
-    demo_checks = {
-        "use_demo": bool(config.okx.use_demo),
-        "allow_order_placement": bool(config.trading.allow_order_placement),
-        "api_key": bool(config.okx.api_key),
-        "secret_key": bool(config.okx.secret_key),
-        "passphrase": bool(config.okx.passphrase),
-        "approved_candidate_gate": bool(execution_approval["ready"]),
-    }
-    demo_reasons: list[str] = []
-    if not demo_checks["use_demo"]:
-        demo_reasons.append("okx.use_demo=false")
-    if not demo_checks["allow_order_placement"]:
-        demo_reasons.append("trading.allow_order_placement=false")
-    if not demo_checks["api_key"]:
-        demo_reasons.append("missing OKX_API_KEY")
-    if not demo_checks["secret_key"]:
-        demo_reasons.append("missing OKX_SECRET_KEY")
-    if not demo_checks["passphrase"]:
-        demo_reasons.append("missing OKX_PASSPHRASE")
-    if not demo_checks["approved_candidate_gate"]:
-        for reason in execution_approval.get("reasons") or []:
-            demo_reasons.append(f"execution approval: {reason}")
-
-    demo_ready = all(demo_checks.values())
-    demo_mode = "submit_ready" if demo_ready else "plan_only"
-    if any((demo_checks["use_demo"], demo_checks["allow_order_placement"])) and not demo_ready:
-        demo_mode = "submit_blocked"
-
-    telegram_ready = (
-        config.alerts.telegram_enabled
-        and bool(config.alerts.telegram_bot_token)
-        and bool(config.alerts.telegram_chat_id)
-    )
-    email_ready = (
-        config.alerts.email_enabled
-        and bool(config.alerts.email_from)
-        and bool(config.alerts.email_to)
-        and bool(config.alerts.smtp_host)
-        and (not config.alerts.smtp_username or bool(config.alerts.smtp_password))
-    )
-
-    return {
-        "demo_trading": {
-            "mode": demo_mode,
-            "ready": demo_ready,
-            "checks": demo_checks,
-            "reasons": demo_reasons,
-        },
-        "alerts": {
-            "any_ready": telegram_ready or email_ready,
-            "channels": {
-                "telegram": {
-                    "enabled": bool(config.alerts.telegram_enabled),
-                    "ready": telegram_ready,
-                },
-                "email": {
-                    "enabled": bool(config.alerts.email_enabled),
-                    "ready": email_ready,
-                },
-            },
-        },
-        "okx_connectivity": _build_okx_connectivity_payload(config=config, latest_demo_heartbeat=latest_demo_heartbeat),
-        "execution_loop": {
-            "latest_heartbeat": _heartbeat_to_dict(latest_demo_heartbeat) if latest_demo_heartbeat is not None else None,
-            "executor_state": executor_state,
-        },
-        "execution_approval": execution_approval,
-        "strategy_router": strategy_router,
-    }
-
-
-def _normalize_executor_state_payload(
-    *,
-    executor_state: dict[str, Any] | None,
-    latest_demo_heartbeat: ServiceHeartbeat | None,
-) -> dict[str, Any] | None:
-    if not isinstance(executor_state, dict):
-        return executor_state
-    last_error = executor_state.get("last_error")
-    if not isinstance(last_error, dict) or latest_demo_heartbeat is None:
-        return executor_state
-    if latest_demo_heartbeat.status == "error":
-        return executor_state
-
-    error_timestamp_raw = last_error.get("timestamp")
-    if not error_timestamp_raw:
-        return executor_state
-    try:
-        error_timestamp = datetime.fromisoformat(str(error_timestamp_raw).replace("Z", "+00:00"))
-    except ValueError:
-        return executor_state
-
-    heartbeat_created_at = latest_demo_heartbeat.created_at
-    if heartbeat_created_at is None:
-        return executor_state
-    if heartbeat_created_at.tzinfo is None:
-        heartbeat_created_at = heartbeat_created_at.replace(tzinfo=timezone.utc)
-    if error_timestamp.tzinfo is None:
-        error_timestamp = error_timestamp.replace(tzinfo=timezone.utc)
-    if heartbeat_created_at < error_timestamp:
-        return executor_state
-
-    payload = dict(executor_state)
-    payload["recovered_error"] = last_error
-    payload["last_error"] = None
-    return payload
-
-
-def _build_okx_connectivity_payload(
-    *,
-    config: AppConfig,
-    latest_demo_heartbeat: ServiceHeartbeat | None,
-) -> dict[str, Any]:
-    heartbeat_details = latest_demo_heartbeat.details if latest_demo_heartbeat is not None else {}
-    heartbeat_details = heartbeat_details if isinstance(heartbeat_details, dict) else {}
-    latest_auth_error = heartbeat_details.get("error")
-    egress_ip = _resolve_proxy_egress_ip(config.okx.proxy_url)
-    notes: list[str] = []
-    if config.okx.proxy_url:
-        notes.append(f"OKX private API currently uses proxy {config.okx.proxy_url}.")
-    if latest_auth_error:
-        notes.append("The latest OKX private API attempt failed.")
-        if "401 Unauthorized" in str(latest_auth_error):
-            notes.append("OKX returned 401 Unauthorized for the current credentials.")
-            if egress_ip:
-                notes.append(
-                    f"If the API key is IP-restricted, whitelist the current proxy egress IP: {egress_ip}."
-                )
-    elif config.okx.api_key and config.okx.secret_key and config.okx.passphrase:
-        notes.append("Credentials are present, but no recent private-auth error is recorded.")
-
-    return {
-        "profile": config.okx.profile,
-        "config_file": str(config.okx.config_file) if config.okx.config_file else None,
-        "use_demo": bool(config.okx.use_demo),
-        "proxy_url": config.okx.proxy_url,
-        "egress_ip": egress_ip,
-        "latest_auth_error": latest_auth_error,
-        "notes": notes,
-    }
 
 
 def _resolve_proxy_egress_ip(proxy_url: str | None) -> str | None:
-    if not proxy_url:
-        return None
-    now = datetime.now(timezone.utc).timestamp()
-    cached = _PROXY_EGRESS_IP_CACHE.get(proxy_url)
-    if cached and cached[0] > now:
-        return cached[1]
-
-    egress_ip: str | None = None
-    try:
-        with httpx.Client(proxy=proxy_url, timeout=8.0) as client:
-            response = client.get("https://api.ipify.org")
-            response.raise_for_status()
-            value = response.text.strip()
-            egress_ip = value or None
-    except Exception:
-        egress_ip = None
-
-    _PROXY_EGRESS_IP_CACHE[proxy_url] = (now + _PROXY_EGRESS_IP_TTL_SECONDS, egress_ip)
-    return egress_ip
-
-
-def _load_executor_state(config: AppConfig, project_root: Path) -> dict[str, Any] | None:
-    storage = config.storage.resolved(project_root)
-    state_path = storage.data_dir / "demo_executor_state.json"
-    if not state_path.exists():
-        return None
-    try:
-        payload = json.loads(state_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {"path": str(state_path), "status": "invalid_json"}
-    return {
-        "path": str(state_path),
-        "last_submitted_at": payload.get("last_submitted_at"),
-        "last_submitted_signature": payload.get("last_submitted_signature"),
-        "last_error": payload.get("last_error"),
-        "last_plan": payload.get("last_plan"),
-        "last_signal": payload.get("last_signal"),
-        "symbols": payload.get("symbols"),
-    }
+    return runtime_resolve_proxy_egress_ip(proxy_url)

@@ -1,0 +1,15 @@
+default_profile = "okx-demo"
+
+[profiles.okx-demo]
+api_key = "REPLACE_ME"
+secret_key = "REPLACE_ME"
+passphrase = "REPLACE_ME"
+proxy_url = "http://127.0.0.1:7890"
+demo = true
+
+[profiles.okx-live-btc-single]
+api_key = "REPLACE_ME"
+secret_key = "REPLACE_ME"
+passphrase = "REPLACE_ME"
+proxy_url = "http://127.0.0.1:7890"
+demo = false

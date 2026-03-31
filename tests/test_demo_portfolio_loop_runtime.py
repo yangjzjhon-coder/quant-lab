@@ -13,9 +13,11 @@ from quant_lab.config import (
     AppConfig,
     DatabaseConfig,
     InstrumentConfig,
+    OkxConfig,
     PortfolioConfig,
     StorageConfig,
     StrategyConfig,
+    TradingConfig,
 )
 from quant_lab.execution.planner import (
     AccountSnapshot,
@@ -25,6 +27,7 @@ from quant_lab.execution.planner import (
     SignalSnapshot,
 )
 from quant_lab.service.database import AlertEvent, ServiceHeartbeat, init_db, make_session_factory, session_scope
+from quant_lab.service.demo_runtime import normalize_demo_heartbeat_contract, normalize_demo_heartbeat_details
 
 
 def test_run_demo_portfolio_loop_cycle_records_portfolio_heartbeat_and_state(
@@ -87,15 +90,158 @@ def test_run_demo_portfolio_loop_cycle_records_portfolio_heartbeat_and_state(
     with session_scope(session_factory) as session:
         heartbeat = session.execute(select(ServiceHeartbeat)).scalar_one()
         alerts = list(session.execute(select(AlertEvent)).scalars())
-        assert heartbeat.service_name == "quant-lab-demo-loop"
+        assert heartbeat.service_name == "quant-lab-demo-loop-portfolio"
         assert heartbeat.status == "submitted"
         assert heartbeat.details["mode"] == "portfolio"
-        assert heartbeat.details["symbol_count"] == 2
-        assert heartbeat.details["submitted_symbol_count"] == 2
-        assert heartbeat.details["symbol_states"]["BTC-USDT-SWAP"]["target_contracts"] == 12.0
+        assert "symbol_count" not in heartbeat.details
+        assert "submitted_symbol_count" not in heartbeat.details
+        assert heartbeat.details["summary"]["mode"] == "portfolio"
+        assert heartbeat.details["summary"]["actionable_symbol_count"] == 2
+        assert heartbeat.details["summary"]["symbol_count"] == 2
+        assert heartbeat.details["summary"]["submitted_symbol_count"] == 2
+        assert heartbeat.details["account"]["total_equity"] == 20_000.0
+        assert heartbeat.details["symbol_states"]["BTC-USDT-SWAP"]["plan"]["action"] == "open"
+        assert heartbeat.details["symbol_states"]["BTC-USDT-SWAP"]["plan"]["target_contracts"] == 12.0
+        assert heartbeat.details["symbol_states"]["ETH-USDT-SWAP"]["signal"]["desired_side"] == 1
+        assert heartbeat.details["symbol_states"]["BTC-USDT-SWAP"]["planning_account"]["available_equity"] == 10_000.0
         assert len(alerts) == 1
         assert alerts[0].event_key == "demo_order_submitted"
         assert alerts[0].channel == "telegram"
+
+
+def test_normalize_demo_heartbeat_contract_strips_portfolio_compatibility_aliases() -> None:
+    payload = normalize_demo_heartbeat_contract(
+        {
+            "mode": "portfolio",
+            "cycle": 7,
+            "action": "1/2 submitted",
+            "symbol_count": 2,
+            "submitted_symbol_count": 1,
+            "actionable_symbol_count": 2,
+            "active_position_symbol_count": 1,
+            "response_count": 1,
+            "warning_count": 1,
+            "total_equity": 20_000.0,
+            "available_equity": 19_000.0,
+            "currency": "USDT",
+            "symbol_states": {
+                "BTC-USDT-SWAP": {
+                    "action": "open",
+                    "desired_side": 1,
+                    "current_side": 0,
+                    "current_contracts": 0.0,
+                    "target_contracts": 8.0,
+                    "latest_price": 71_344.0,
+                    "signal_time": "2026-03-25T08:00:00+00:00",
+                    "effective_time": "2026-03-25T08:01:00+00:00",
+                    "position_mode": "net_mode",
+                },
+                "ETH-USDT-SWAP": {
+                    "action": "hold",
+                    "desired_side": 1,
+                    "current_side": 1,
+                    "current_contracts": 5.0,
+                    "target_contracts": 4.0,
+                    "latest_price": 3_820.0,
+                    "signal_time": "2026-03-25T08:00:00+00:00",
+                    "effective_time": "2026-03-25T08:01:00+00:00",
+                    "position_mode": "net_mode",
+                },
+            },
+        },
+        status="warning",
+    )
+
+    assert payload["mode"] == "portfolio"
+    assert payload["summary"]["symbol_count"] == 2
+    assert payload["summary"]["actionable_symbol_count"] == 2
+    assert payload["account"]["total_equity"] == 20_000.0
+    assert payload["symbol_states"]["BTC-USDT-SWAP"]["plan"]["target_contracts"] == 8.0
+    assert payload["symbol_states"]["ETH-USDT-SWAP"]["position"]["contracts"] == 5.0
+    assert payload["symbol_states"]["BTC-USDT-SWAP"]["signal"]["alpha_signal"]["side"] == 1
+    assert "cycle" not in payload
+    assert "action" not in payload
+    assert "symbol_count" not in payload
+    assert "submitted_symbol_count" not in payload
+    assert "actionable_symbol_count" not in payload
+
+
+def test_normalize_demo_heartbeat_details_whitelists_portfolio_compatibility_aliases() -> None:
+    payload = normalize_demo_heartbeat_details(
+        {
+            "mode": "portfolio",
+            "cycle": 7,
+            "action": "1/2 submitted",
+            "symbol_count": 2,
+            "submitted_symbol_count": 1,
+            "actionable_symbol_count": 2,
+            "active_position_symbol_count": 1,
+            "response_count": 1,
+            "warning_count": 1,
+            "total_equity": 20_000.0,
+            "available_equity": 19_000.0,
+            "currency": "USDT",
+            "unexpected_field": "should_not_leak",
+            "symbol_states": {
+                "BTC-USDT-SWAP": {
+                    "action": "open",
+                    "desired_side": 1,
+                    "current_side": 0,
+                    "current_contracts": 0.0,
+                    "target_contracts": 8.0,
+                    "latest_price": 71_344.0,
+                    "signal_time": "2026-03-25T08:00:00+00:00",
+                    "effective_time": "2026-03-25T08:01:00+00:00",
+                    "position_mode": "net_mode",
+                },
+                "ETH-USDT-SWAP": {
+                    "action": "hold",
+                    "desired_side": 1,
+                    "current_side": 1,
+                    "current_contracts": 5.0,
+                    "target_contracts": 4.0,
+                    "latest_price": 3_820.0,
+                    "signal_time": "2026-03-25T08:00:00+00:00",
+                    "effective_time": "2026-03-25T08:01:00+00:00",
+                    "position_mode": "net_mode",
+                },
+            },
+        },
+        status="warning",
+    )
+
+    assert payload["cycle"] == 7
+    assert payload["symbol_count"] == 2
+    assert payload["submitted_symbol_count"] == 1
+    assert payload["actionable_symbol_count"] == 2
+    assert payload["active_position_symbol_count"] == 1
+    assert payload["total_equity"] == 20_000.0
+    assert payload["summary"]["mode"] == "portfolio"
+    assert payload["account"]["currency"] == "USDT"
+    assert payload["symbol_states"]["BTC-USDT-SWAP"]["plan"]["target_contracts"] == 8.0
+    assert "currency" not in payload
+    assert "unexpected_field" not in payload
+    assert "strategy_router_enabled" not in payload
+    assert "executor_state_path" not in payload
+    assert "executor_state_status" not in payload
+    assert set(payload) == {
+        "mode",
+        "summary",
+        "account",
+        "symbols",
+        "symbol_states",
+        "cycle",
+        "status",
+        "symbol_count",
+        "submitted_symbol_count",
+        "actionable_symbol_count",
+        "active_position_symbol_count",
+        "response_count",
+        "warning_count",
+        "action",
+        "total_equity",
+        "available_equity",
+    }
 
 
 def _runtime_config(tmp_path: Path) -> AppConfig:
@@ -106,9 +252,16 @@ def _runtime_config(tmp_path: Path) -> AppConfig:
     raw_dir.mkdir(parents=True, exist_ok=True)
     report_dir.mkdir(parents=True, exist_ok=True)
     return AppConfig(
+        okx=OkxConfig(
+            use_demo=True,
+            api_key="demo-key",
+            secret_key="demo-secret",
+            passphrase="demo-passphrase",
+        ),
         instrument=InstrumentConfig(symbol="BTC-USDT-SWAP", settle_currency="USDT"),
         portfolio=PortfolioConfig(symbols=["BTC-USDT-SWAP", "ETH-USDT-SWAP"]),
         strategy=StrategyConfig(name="ema_trend_4h"),
+        trading=TradingConfig(allow_order_placement=True),
         storage=StorageConfig(data_dir=data_dir, raw_dir=raw_dir, report_dir=report_dir),
         database=DatabaseConfig(url=f"sqlite:///{(tmp_path / 'quant_lab.db').as_posix()}"),
         alerts=AlertsConfig(

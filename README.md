@@ -1,5 +1,16 @@
 # Quant Lab
 
+## 接手导览
+
+- 修改前检查清单：[docs/change_preflight_checklist_2026-03-31.md](docs/change_preflight_checklist_2026-03-31.md)
+- 迭代前 Readiness：[docs/iteration_readiness_checklist_2026-03-31.md](docs/iteration_readiness_checklist_2026-03-31.md)
+- 产品化差距评估：[docs/productization_gap_assessment_2026-03-31.md](docs/productization_gap_assessment_2026-03-31.md)
+- 2026-03-31 修改计划：[docs/modification_plan_2026-03-31.md](docs/modification_plan_2026-03-31.md)
+- 接手导览：[docs/maintainer_onboarding_2026-03-29.md](docs/maintainer_onboarding_2026-03-29.md)
+- 双标研究流：[docs/BTC_ETH双标的研究流_2026-03-26.md](docs/BTC_ETH双标的研究流_2026-03-26.md)
+- 研究治理流：[docs/research_governance_workflow_2026-03-28.md](docs/research_governance_workflow_2026-03-28.md)
+- 高权重策略说明：[docs/high_weight_long_strategy_2026-03-28.md](docs/high_weight_long_strategy_2026-03-28.md)
+
 面向 `OKX BTC-USDT-SWAP` 的本地量化研究与运行脚手架，当前重点是：
 
 - `4h` 均线趋势回测

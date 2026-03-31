@@ -9,13 +9,13 @@ import plotly.graph_objects as go
 def render_trend_research_dashboard(results: pd.DataFrame, output_path: Path, title: str) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if results.empty:
-        output_path.write_text("<html><body><h1>No research results.</h1></body></html>", encoding="utf-8")
+        output_path.write_text("<html><body><h1>暂无研究结果。</h1></body></html>", encoding="utf-8")
         return
 
     top = results.head(15).copy()
     scatter_html = _build_scatter(results, title).to_html(
         full_html=False,
-        include_plotlyjs="cdn",
+        include_plotlyjs=True,
         config={"displaylogo": False, "responsive": True},
     )
     variant_html = _build_variant_bars(results).to_html(
@@ -47,7 +47,7 @@ def _build_scatter(results: pd.DataFrame, title: str) -> go.Figure:
                     "color": results["bear_return_pct"],
                     "colorscale": "Tealgrn",
                     "showscale": True,
-                    "colorbar": {"title": "Bear Return %"},
+                    "colorbar": {"title": "熊市收益 %"},
                     "line": {"width": 1, "color": "rgba(15,23,42,0.18)"},
                 },
                 customdata=results[
@@ -63,24 +63,24 @@ def _build_scatter(results: pd.DataFrame, title: str) -> go.Figure:
                     ]
                 ].values,
                 hovertemplate=(
-                    "Variant %{customdata[0]}<br>"
-                    "EMA %{customdata[1]}/%{customdata[2]} | ATRx %{customdata[3]}<br>"
-                    "Trend EMA %{customdata[4]} | ADX %{customdata[5]}<br>"
-                    "Return %{y:.2f}% | DD %{x:.2f}%<br>"
-                    "Bear Return %{marker.color:.2f}%<br>"
-                    "Sharpe %{customdata[7]:.2f} | Score %{customdata[6]:.4f}<extra></extra>"
+                    "变体 %{customdata[0]}<br>"
+                    "EMA %{customdata[1]}/%{customdata[2]} | ATR 倍数 %{customdata[3]}<br>"
+                    "趋势 EMA %{customdata[4]} | ADX %{customdata[5]}<br>"
+                    "总收益 %{y:.2f}% | 最大回撤 %{x:.2f}%<br>"
+                    "熊市收益 %{marker.color:.2f}%<br>"
+                    "夏普 %{customdata[7]:.2f} | 研究评分 %{customdata[6]:.4f}<extra></extra>"
                 ),
             )
         ]
     )
     figure.update_layout(
-        title=f"{title}: Return / Drawdown / Bear Return",
+        title=f"{title}：收益 / 回撤 / 熊市收益",
         template="plotly_white",
         height=440,
         margin={"l": 40, "r": 20, "t": 60, "b": 40},
     )
-    figure.update_xaxes(title="Max Drawdown %")
-    figure.update_yaxes(title="Total Return %")
+    figure.update_xaxes(title="最大回撤 %")
+    figure.update_yaxes(title="总收益 %")
     return figure
 
 
@@ -96,22 +96,22 @@ def _build_variant_bars(results: pd.DataFrame) -> go.Figure:
         go.Bar(
             x=best_by_variant["variant"],
             y=best_by_variant["research_score"],
-            name="Research Score",
+            name="研究评分",
             marker_color="#0f766e",
-            hovertemplate="Variant %{x}<br>Score %{y:.4f}<extra></extra>",
+            hovertemplate="变体 %{x}<br>研究评分 %{y:.4f}<extra></extra>",
         )
     )
     figure.add_trace(
         go.Bar(
             x=best_by_variant["variant"],
             y=best_by_variant["bear_return_pct"],
-            name="Bear Return %",
+            name="熊市收益 %",
             marker_color="#ca6702",
-            hovertemplate="Variant %{x}<br>Bear Return %{y:.2f}%<extra></extra>",
+            hovertemplate="变体 %{x}<br>熊市收益 %{y:.2f}%<extra></extra>",
         )
     )
     figure.update_layout(
-        title="Best Candidate by Variant",
+        title="各变体最佳候选",
         template="plotly_white",
         height=380,
         margin={"l": 40, "r": 20, "t": 60, "b": 40},
@@ -138,17 +138,17 @@ def _build_table(results: pd.DataFrame) -> go.Figure:
             go.Table(
                 header={
                     "values": [
-                        "Variant",
-                        "Fast",
-                        "Slow",
-                        "ATRx",
-                        "Trend EMA",
+                        "变体",
+                        "快 EMA",
+                        "慢 EMA",
+                        "ATR 倍数",
+                        "趋势 EMA",
                         "ADX",
-                        "Return %",
-                        "Bear %",
-                        "Max DD %",
-                        "Sharpe",
-                        "Score",
+                        "收益 %",
+                        "熊市收益 %",
+                        "最大回撤 %",
+                        "夏普",
+                        "研究评分",
                     ],
                     "fill_color": "#0f766e",
                     "font": {"color": "white", "size": 13},
@@ -176,7 +176,7 @@ def _build_table(results: pd.DataFrame) -> go.Figure:
         ]
     )
     figure.update_layout(
-        title="Top Research Results",
+        title="最佳研究结果",
         template="plotly_white",
         height=460,
         margin={"l": 20, "r": 20, "t": 60, "b": 20},
@@ -187,13 +187,13 @@ def _build_table(results: pd.DataFrame) -> go.Figure:
 def _document(title: str, results: pd.DataFrame, scatter_html: str, variant_html: str, table_html: str) -> str:
     best = results.iloc[0]
     cards = [
-        ("Candidates", f"{len(results)}"),
-        ("Best Variant", str(best.variant)),
-        ("Best EMA", f"{int(best.fast_ema)}/{int(best.slow_ema)}"),
-        ("Best ATRx", f"{best.atr_stop_multiple:.2f}"),
-        ("Best Bear Return", f"{best.bear_return_pct:.2f}%"),
-        ("Best Max DD", f"{best.max_drawdown_pct:.2f}%"),
-        ("Research Score", f"{best.research_score:.4f}"),
+        ("候选数量", f"{len(results)}"),
+        ("最佳变体", str(best.variant)),
+        ("最佳 EMA", f"{int(best.fast_ema)}/{int(best.slow_ema)}"),
+        ("最佳 ATR 倍数", f"{best.atr_stop_multiple:.2f}"),
+        ("最佳熊市收益", f"{best.bear_return_pct:.2f}%"),
+        ("最佳最大回撤", f"{best.max_drawdown_pct:.2f}%"),
+        ("研究评分", f"{best.research_score:.4f}"),
     ]
     cards_html = "\n".join(
         (
@@ -210,7 +210,7 @@ def _document(title: str, results: pd.DataFrame, scatter_html: str, variant_html
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{title} Trend Research</title>
+  <title>{title} 趋势研究看板</title>
   <style>
     body {{
       margin: 0;
@@ -282,23 +282,23 @@ def _document(title: str, results: pd.DataFrame, scatter_html: str, variant_html
   <div class="shell">
     <section class="hero">
       <h1>{title}</h1>
-      <p>1 小时趋势策略多变种研究报表。评分强调熊市收益、最大回撤、Sharpe 和总收益，适合挑选更稳的实盘候选。</p>
+      <p>趋势研究看板会同时强调收益、最大回撤、熊市收益与研究评分，适合用来挑选更稳健的候选策略。</p>
     </section>
     <section class="cards">
       {cards_html}
     </section>
     <section class="grid">
       <div class="panel">
-        <div class="section-title">Return / Drawdown / Bear Return</div>
+        <div class="section-title">收益 / 回撤 / 熊市收益</div>
         {scatter_html}
       </div>
       <div class="panel">
-        <div class="section-title">Variant Comparison</div>
+        <div class="section-title">变体对比</div>
         {variant_html}
       </div>
     </section>
     <section class="panel">
-      <div class="section-title">Top Results</div>
+      <div class="section-title">最佳结果</div>
       {table_html}
     </section>
   </div>

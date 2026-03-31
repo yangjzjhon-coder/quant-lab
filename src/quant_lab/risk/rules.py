@@ -47,21 +47,30 @@ class WeeklyDrawdownGuard:
     current_week: tuple[int, int] | None = None
     weekly_peak: float = 0.0
     halted: bool = False
+    resume_equity: float | None = None
 
     def update(self, timestamp: pd.Timestamp, equity: float) -> bool:
         iso = timestamp.isocalendar()
         week_id = (int(iso.year), int(iso.week))
 
-        if self.current_week != week_id:
+        if self.halted and self.resume_equity is not None and equity >= self.resume_equity:
+            self.halted = False
+            self.resume_equity = None
             self.current_week = week_id
             self.weekly_peak = equity
-            self.halted = False
+            return False
+
+        if self.current_week != week_id:
+            self.current_week = week_id
+            if not self.halted:
+                self.weekly_peak = equity
 
         self.weekly_peak = max(self.weekly_peak, equity)
-        if self.weekly_peak > 0:
+        if not self.halted and self.weekly_peak > 0:
             drawdown = (self.weekly_peak - equity) / self.weekly_peak
             if drawdown >= self.threshold:
                 self.halted = True
+                self.resume_equity = self.weekly_peak * (1.0 - self.threshold)
         return self.halted
 
 

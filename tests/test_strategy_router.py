@@ -78,6 +78,12 @@ strategy:
     assert decision.selected_variant == "trend_breakout_long"
     assert decision.candidate is not None
     assert decision.candidate["candidate_name"] == "btc_bull_breakout"
+    payload = decision.to_dict()
+    assert payload["route"]["label"] == "bull_trend"
+    assert payload["selection"]["strategy_name"] == "trend_breakout_4h"
+    assert payload["selection"]["strategy_variant"] == "trend_breakout_long"
+    assert payload["display"]["selection_label"] == "trend_breakout_4h / trend_breakout_long @ 4H->1m"
+    assert payload["display"]["status_label"] == "route_ready"
 
 
 def test_strategy_router_falls_back_when_regime_route_is_missing(tmp_path: Path) -> None:
@@ -159,6 +165,8 @@ strategy:
     assert status["ready"] is False
     assert status["routes"][0]["route_key"] == "bull_trend"
     assert status["routes"][0]["ready"] is True
+    assert status["routes"][0]["display"]["route_label"] == "bull_trend"
+    assert status["routes"][0]["display"]["candidate_name"] == "btc_default"
     assert status["routes"][1]["route_key"] == "range"
     assert status["routes"][1]["ready"] is False
 

@@ -2,6 +2,25 @@ okx:
   rest_base_url: "https://www.okx.com"
   use_demo: false
 
+market_data:
+  provider: "okx"
+  base_url: null
+  proxy_url: null
+  timeout_seconds: 20.0
+  api_key: null
+  extra_headers: {}
+  provider_options: {}
+  # Custom provider example:
+  # provider: "my_feed"
+  # base_url: "https://feed.example.com"
+  # api_key: null
+  # extra_headers:
+  #   X-Workspace: "quant-lab"
+  # provider_options:
+  #   symbol_map:
+  #     BTC-USDT-SWAP: "BTC-PERP"
+  #     ETH-USDT-SWAP: "ETH-PERP"
+
 instrument:
   symbol: "BTC-USDT-SWAP"
   instrument_type: "SWAP"
@@ -130,3 +149,52 @@ research_ai:
   role_models: {}
   role_system_prompts: {}
   extra_headers: {}
+  provider_options: {}
+
+research_agent:
+  enabled: false
+  provider: "disabled"
+  base_url: null
+  api_key: null
+  timeout_seconds: 90.0
+  max_retries: 1
+  workflow_path: "/run"
+  probe_path: "/health"
+  extra_headers: {}
+  local_repo_path: null
+  python_executable: null
+  provider_options: {}
+  # TradingAgents example:
+  # enabled: true
+  # provider: "tradingagents"
+  # local_repo_path: "/abs/path/to/TradingAgents"
+  # python_executable: "/abs/path/to/python"
+  # provider_options:
+  #   debug: true
+  #   selected_analysts:
+  #     - "market"
+  #     - "news"
+  #   symbol_map:
+  #     BTC-USDT-SWAP: "BTC-USD"
+  #     ETH-USDT-SWAP: "ETH-USD"
+  #   config_overrides:
+  #     llm_provider: "openai"
+  #     deep_think_llm: "gpt-5.2"
+  #     quick_think_llm: "gpt-5-mini"
+
+rollout:
+  phase: "research"
+  account_profile: null
+  allowed_symbol: null
+  required_candidate_id: null
+  required_candidate_name: null
+  required_signal_bar: null
+  required_execution_bar: null
+  # Stage 0 live-single example:
+  # phase: "live_single"
+  # account_profile: "okx-live-btc-single"
+  # allowed_symbol: "BTC-USDT-SWAP"
+  # required_candidate_id: 101
+  # required_candidate_name: "btc_breakout_live_v1"
+  # required_signal_bar: "4H"
+  # required_execution_bar: "1m"

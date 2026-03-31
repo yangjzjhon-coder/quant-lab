@@ -16,6 +16,7 @@ from quant_lab.execution.strategy_router import (
 )
 from quant_lab.models import BacktestArtifacts
 from quant_lab.service.database import StrategyCandidate, session_scope
+from quant_lab.strategy_contracts import execution_signal_from_row
 from quant_lab.strategies.ema_trend import prepare_signal_frame
 
 
@@ -136,33 +137,54 @@ def build_routed_signal_frame(
         elif fallback_to_config:
             fallback_used = True
         else:
-            selected_row = {
-                "desired_side": 0,
-                "stop_distance": 0.0,
-                "stop_price": pd.NA,
-                "strategy_score": pd.NA,
-                "strategy_risk_multiplier": 0.0,
-            }
+            selected_row = _flat_signal_payload(
+                timestamp=timestamp,
+                regime=regime,
+                route_key=route_key,
+                strategy_name=base_strategy.name,
+                strategy_variant=base_strategy.variant,
+            )
 
-        signal_rows.append(
+        # Preserve the actual market bar context for routed artifacts so downstream
+        # reporting can render the same dashboard inputs as ordinary backtests.
+        selected_row = {**base_row, **selected_row}
+
+        selected_contract_strategy_name = selected_row.get("contract_strategy_name") or selected_strategy_name
+        selected_contract_strategy_variant = selected_row.get("contract_strategy_variant") or selected_variant
+        selected_alpha_regime = selected_row.get("alpha_regime")
+        if selected_alpha_regime is None or pd.isna(selected_alpha_regime):
+            selected_alpha_regime = regime
+
+        signal_row = dict(selected_row)
+        signal_row.update(
             {
                 "timestamp": timestamp,
                 "desired_side": int(selected_row["desired_side"]),
+                "execution_desired_side": int(selected_row.get("execution_desired_side", selected_row["desired_side"])),
+                "alpha_side": int(selected_row.get("alpha_side", selected_row["desired_side"])),
                 "stop_distance": float(selected_row["stop_distance"]),
+                "risk_stop_distance": float(selected_row.get("risk_stop_distance", selected_row["stop_distance"])),
                 "stop_price": selected_row.get("stop_price"),
+                "risk_stop_price": selected_row.get("risk_stop_price", selected_row.get("stop_price")),
                 "strategy_score": selected_row.get("strategy_score"),
+                "alpha_score": selected_row.get("alpha_score", selected_row.get("strategy_score")),
                 "strategy_risk_multiplier": selected_row.get("strategy_risk_multiplier", 1.0),
+                "risk_multiplier": selected_row.get("risk_multiplier", selected_row.get("strategy_risk_multiplier", 1.0)),
                 "regime": regime,
+                "alpha_regime": selected_alpha_regime,
                 "route_key": route_key,
+                "contract_strategy_name": selected_contract_strategy_name,
+                "contract_strategy_variant": selected_contract_strategy_variant,
                 "route_status": route_status,
                 "selected_candidate_id": selected_candidate_id,
                 "selected_candidate_name": selected_candidate_name,
                 "selected_strategy_source": selected_strategy_source,
-                "selected_strategy_name": selected_strategy_name,
-                "selected_variant": selected_variant,
+                "selected_strategy_name": selected_contract_strategy_name,
+                "selected_variant": selected_contract_strategy_variant,
                 "fallback_used": fallback_used,
             }
         )
+        signal_rows.append(signal_row)
         route_rows.append(
             {
                 "timestamp": timestamp,
@@ -173,12 +195,22 @@ def build_routed_signal_frame(
                 "selected_candidate_id": selected_candidate_id,
                 "selected_candidate_name": selected_candidate_name,
                 "selected_strategy_source": selected_strategy_source,
-                "selected_strategy_name": selected_strategy_name,
-                "selected_variant": selected_variant,
+                "selected_strategy_name": selected_contract_strategy_name,
+                "selected_variant": selected_contract_strategy_variant,
                 "desired_side": int(selected_row["desired_side"]),
+                "execution_desired_side": int(selected_row.get("execution_desired_side", selected_row["desired_side"])),
+                "alpha_side": int(selected_row.get("alpha_side", selected_row["desired_side"])),
                 "stop_distance": float(selected_row["stop_distance"]),
+                "risk_stop_distance": float(selected_row.get("risk_stop_distance", selected_row["stop_distance"])),
+                "stop_price": selected_row.get("stop_price"),
+                "risk_stop_price": selected_row.get("risk_stop_price", selected_row.get("stop_price")),
                 "strategy_score": selected_row.get("strategy_score"),
+                "alpha_score": selected_row.get("alpha_score", selected_row.get("strategy_score")),
                 "strategy_risk_multiplier": selected_row.get("strategy_risk_multiplier", 1.0),
+                "risk_multiplier": selected_row.get("risk_multiplier", selected_row.get("strategy_risk_multiplier", 1.0)),
+                "alpha_regime": selected_alpha_regime,
+                "contract_strategy_name": selected_contract_strategy_name,
+                "contract_strategy_variant": selected_contract_strategy_variant,
                 "fallback_used": fallback_used,
                 "close": float(regime_row.close),
                 "ema_fast": float(regime_row.ema_fast),
@@ -290,15 +322,93 @@ def _load_candidate_strategy_config(*, candidate: StrategyCandidate, project_roo
 
 def _signal_lookup(signal_frame: pd.DataFrame) -> dict[pd.Timestamp, dict[str, Any]]:
     return {
-        pd.Timestamp(row.timestamp): {
-            "desired_side": int(row.desired_side),
-            "stop_distance": float(row.stop_distance),
-            "stop_price": row.stop_price,
-            "strategy_score": getattr(row, "strategy_score", pd.NA),
-            "strategy_risk_multiplier": getattr(row, "strategy_risk_multiplier", 1.0),
-        }
+        pd.Timestamp(row.timestamp): _signal_payload_from_row(row)
         for row in signal_frame.itertuples(index=False)
     }
+
+
+def _signal_payload_from_row(
+    row: pd.Series | Any,
+    *,
+    strategy_name: str | None = None,
+    strategy_variant: str | None = None,
+    regime: str | None = None,
+    route_key: str | None = None,
+) -> dict[str, Any]:
+    payload = _row_to_mapping(row)
+    signal_contract = execution_signal_from_row(
+        row,
+        previous_side=0,
+        strategy_name=strategy_name,
+        strategy_variant=strategy_variant,
+    )
+    alpha_regime = signal_contract.alpha_signal.regime or regime
+    resolved_route_key = signal_contract.route_key or route_key
+    resolved_strategy_name = signal_contract.alpha_signal.strategy_name or strategy_name
+    resolved_strategy_variant = signal_contract.alpha_signal.strategy_variant or strategy_variant
+    payload.update(
+        {
+            "timestamp": signal_contract.signal_time,
+            "desired_side": signal_contract.desired_side,
+            "execution_desired_side": signal_contract.desired_side,
+            "alpha_side": signal_contract.alpha_signal.side,
+            "strategy_score": signal_contract.alpha_signal.score,
+            "alpha_score": signal_contract.alpha_signal.score,
+            "regime": alpha_regime,
+            "alpha_regime": alpha_regime,
+            "stop_distance": signal_contract.risk_signal.stop_distance,
+            "risk_stop_distance": signal_contract.risk_signal.stop_distance,
+            "stop_price": signal_contract.risk_signal.stop_price,
+            "risk_stop_price": signal_contract.risk_signal.stop_price,
+            "strategy_risk_multiplier": signal_contract.risk_signal.risk_multiplier,
+            "risk_multiplier": signal_contract.risk_signal.risk_multiplier,
+            "route_key": resolved_route_key,
+            "contract_strategy_name": resolved_strategy_name,
+            "contract_strategy_variant": resolved_strategy_variant,
+        }
+    )
+    return payload
+
+
+def _row_to_mapping(row: pd.Series | Any) -> dict[str, Any]:
+    if isinstance(row, pd.Series):
+        return row.to_dict()
+    if isinstance(row, dict):
+        return dict(row)
+    if hasattr(row, "_asdict"):
+        return dict(row._asdict())
+    return {}
+
+
+def _flat_signal_payload(
+    *,
+    timestamp: pd.Timestamp,
+    regime: str,
+    route_key: str | None,
+    strategy_name: str,
+    strategy_variant: str,
+) -> dict[str, Any]:
+    return _signal_payload_from_row(
+        pd.Series(
+            {
+                "timestamp": timestamp,
+                "execution_desired_side": 0,
+                "alpha_side": 0,
+                "alpha_score": pd.NA,
+                "alpha_regime": regime,
+                "risk_stop_distance": 0.0,
+                "risk_stop_price": pd.NA,
+                "risk_multiplier": 0.0,
+                "route_key": route_key,
+                "contract_strategy_name": strategy_name,
+                "contract_strategy_variant": strategy_variant,
+            }
+        ),
+        strategy_name=strategy_name,
+        strategy_variant=strategy_variant,
+        regime=regime,
+        route_key=route_key,
+    )
 
 
 def summarize_route_frame(route_frame: pd.DataFrame) -> dict[str, Any]:

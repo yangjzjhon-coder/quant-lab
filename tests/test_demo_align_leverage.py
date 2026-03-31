@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+import typer
 from typer.testing import CliRunner
 
 from quant_lab.cli import _build_leverage_alignment_requests, app
@@ -360,6 +361,33 @@ def test_demo_align_leverage_dry_run_in_portfolio_mode_targets_only_misaligned_s
     ]
     assert payload["symbol_plans"]["BTC-USDT-SWAP"]["planned_requests"] == []
     assert payload["before"]["symbol_states"]["ETH-USDT-SWAP"]["checks"]["leverage_match"] is False
+
+
+def test_demo_align_leverage_cli_returns_structured_validation_error(tmp_path: Path, monkeypatch) -> None:
+    config_path = tmp_path / "settings.yaml"
+    config_path.write_text("{}", encoding="utf-8")
+    cfg = _runtime_config(tmp_path)
+
+    monkeypatch.setattr("quant_lab.cli._load_app_context", lambda config, project_root: cfg)
+    monkeypatch.setattr(
+        "quant_lab.cli._run_demo_align_leverage_action",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            typer.BadParameter("Refusing to mutate OKX demo account. Pass --confirm OKX_DEMO to continue.")
+        ),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        ["demo-align-leverage", "--config", str(config_path), "--apply"],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["source"] == "cli"
+    assert payload["command"] == "demo-align-leverage"
+    assert payload["error_code"] == "cli_validation_error"
+    assert payload["error_type"] == "invalid_request"
 
 
 def test_demo_align_leverage_apply_in_portfolio_mode_refreshes_after_state(tmp_path: Path, monkeypatch) -> None:

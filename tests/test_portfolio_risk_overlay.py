@@ -4,7 +4,11 @@ from datetime import datetime, timezone
 
 from quant_lab.data.public_factors import PublicFactorSnapshot
 from quant_lab.execution.planner import OrderInstruction, OrderPlan, SignalSnapshot
-from quant_lab.risk.portfolio import apply_factor_overlay_to_plan, apply_portfolio_risk_caps
+from quant_lab.risk.portfolio import (
+    allocate_portfolio_risk_budgets,
+    apply_factor_overlay_to_plan,
+    apply_portfolio_risk_caps,
+)
 from quant_lab.config import InstrumentConfig
 
 
@@ -57,6 +61,30 @@ def test_apply_portfolio_risk_caps_prefers_higher_priority_symbol() -> None:
     assert decisions["BTC-USDT-SWAP"].priority_score > decisions["ETH-USDT-SWAP"].priority_score
     assert btc_plan.target_contracts >= eth_plan.target_contracts
     assert eth_plan.target_contracts < 100.0
+
+
+def test_allocate_portfolio_risk_budgets_scales_same_direction_requests() -> None:
+    allocations = allocate_portfolio_risk_budgets(
+        requests={
+            "BTC-USDT-SWAP": {
+                "desired_side": 1,
+                "priority_score": 0.8,
+                "requested_risk_fraction": 0.02,
+            },
+            "ETH-USDT-SWAP": {
+                "desired_side": 1,
+                "priority_score": 0.2,
+                "requested_risk_fraction": 0.02,
+            },
+        },
+        portfolio_max_total_risk=0.03,
+        portfolio_max_same_direction_risk=0.03,
+    )
+
+    assert allocations["BTC-USDT-SWAP"].allocated_risk_fraction == 0.02
+    assert allocations["ETH-USDT-SWAP"].allocated_risk_fraction == 0.01
+    assert allocations["BTC-USDT-SWAP"].allocation_scale == 1.0
+    assert allocations["ETH-USDT-SWAP"].allocation_scale == 0.5
 
 
 def _signal(*, strategy_score: float) -> SignalSnapshot:

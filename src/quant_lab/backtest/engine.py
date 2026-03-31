@@ -11,8 +11,11 @@ from quant_lab.backtest.realism import (
 from quant_lab.config import ExecutionConfig, InstrumentConfig, RiskConfig, StrategyConfig
 from quant_lab.models import BacktestArtifacts, Position, TradeRecord
 from quant_lab.risk.rules import WeeklyDrawdownGuard, position_size_from_risk
+from quant_lab.strategy_contracts import apply_signal_contract_columns, execution_signal_from_row
 from quant_lab.strategies.ema_trend import prepare_signal_frame
 from quant_lab.utils.timeframes import bar_to_timedelta
+
+FUNDING_TIMESTAMP_TOLERANCE = pd.Timedelta(minutes=1)
 
 
 def run_backtest(
@@ -29,6 +32,7 @@ def run_backtest(
     funding_rates = _normalize_funding_frame(funding_rates)
 
     signal_frame = prepare_signal_frame(signal_bars, strategy_config)
+    signal_frame.attrs["signal_bar"] = strategy_config.signal_bar
     return run_backtest_from_signal_frame(
         signal_frame=signal_frame,
         execution_bars=execution_bars,
@@ -48,7 +52,10 @@ def run_backtest_from_signal_frame(
     risk_config: RiskConfig,
     instrument_config: InstrumentConfig,
 ) -> BacktestArtifacts:
+    signal_bar_attr = signal_frame.attrs.get("signal_bar")
     signal_frame = _normalize_signal_frame(signal_frame)
+    if signal_bar_attr:
+        signal_frame.attrs["signal_bar"] = signal_bar_attr
     execution_bars = _normalize_market_frame(execution_bars)
     funding_rates = _normalize_funding_frame(funding_rates)
 
@@ -58,8 +65,11 @@ def run_backtest_from_signal_frame(
         _infer_signal_bar(signal_frame),
         execution_config.latency_minutes,
     )
-    funding_lookup = {row.timestamp: row.realized_rate for row in funding_rates.itertuples(index=False)}
-    funding_schedule = _expected_funding_schedule(execution_bars, execution_config.funding_interval_hours)
+    funding_events = _build_funding_events(
+        execution_bars=execution_bars,
+        funding_rates=funding_rates,
+        interval_hours=execution_config.funding_interval_hours,
+    )
 
     fee_rate = execution_config.fee_bps / 10_000
 
@@ -67,7 +77,7 @@ def run_backtest_from_signal_frame(
     cash = execution_config.initial_equity
     position: Position | None = None
     trades: list[TradeRecord] = []
-    equity_rows: list[dict[str, object]] = []
+    equity_rows: list[tuple[pd.Timestamp, float, float, float, bool, int, float]] = []
     liquidated = False
 
     for bar in execution_bars.itertuples(index=False):
@@ -84,13 +94,14 @@ def run_backtest_from_signal_frame(
             volume_quote=_optional_float(getattr(bar, "volume_quote", None)),
         )
 
-        if position is not None and timestamp in funding_schedule:
-            funding_change = conservative_funding_change(
+        funding_event = funding_events.get(timestamp)
+        if position is not None and funding_event is not None:
+            funding_change = _funding_change_for_event(
                 side=position.side,
                 contracts=position.contracts,
                 contract_value=position.contract_value,
                 price=bar_open,
-                actual_rate=funding_lookup.get(timestamp),
+                actual_rates=funding_event,
                 fallback_rate_bps=execution_config.missing_funding_rate_bps,
             )
             cash += funding_change
@@ -244,15 +255,15 @@ def run_backtest_from_signal_frame(
         equity = cash + unrealized
         halted = guard.update(timestamp, equity)
         equity_rows.append(
-            {
-                "timestamp": timestamp,
-                "cash": round(cash, 8),
-                "equity": round(equity, 8),
-                "unrealized_pnl": round(unrealized, 8),
-                "halted": halted,
-                "position_side": position.side if position is not None else 0,
-                "contracts": position.contracts if position is not None else 0.0,
-            }
+            (
+                timestamp,
+                round(cash, 8),
+                round(equity, 8),
+                round(unrealized, 8),
+                halted,
+                position.side if position is not None else 0,
+                position.contracts if position is not None else 0.0,
+            )
         )
         if liquidated:
             break
@@ -280,19 +291,30 @@ def run_backtest_from_signal_frame(
         )
         trades.append(trade)
         equity_rows.append(
-            {
-                "timestamp": pd.Timestamp(last_bar["timestamp"]),
-                "cash": round(cash, 8),
-                "equity": round(cash, 8),
-                "unrealized_pnl": 0.0,
-                "halted": guard.halted,
-                "position_side": 0,
-                "contracts": 0.0,
-            }
+            (
+                pd.Timestamp(last_bar["timestamp"]),
+                round(cash, 8),
+                round(cash, 8),
+                0.0,
+                guard.halted,
+                0,
+                0.0,
+            )
         )
 
     equity_curve = (
-        pd.DataFrame(equity_rows)
+        pd.DataFrame.from_records(
+            equity_rows,
+            columns=[
+                "timestamp",
+                "cash",
+                "equity",
+                "unrealized_pnl",
+                "halted",
+                "position_side",
+                "contracts",
+            ],
+        )
         .drop_duplicates(subset=["timestamp"], keep="last")
         .sort_values("timestamp")
     )
@@ -343,14 +365,18 @@ def _build_signal_events(
             continue
 
         effective_time = pd.Timestamp(execution_index[position])
+        signal_contract = execution_signal_from_row(row, previous_side=int(row.previous_side))
         events[effective_time] = {
-            "signal_time": pd.Timestamp(row.timestamp),
-            "desired_side": int(row.desired_side),
-            "stop_distance": float(row.stop_distance),
-            "stop_price": _optional_float(getattr(row, "stop_price", None)),
-            "side_changed": int(row.desired_side) != int(row.previous_side),
-            "strategy_score": _optional_float(getattr(row, "strategy_score", None)),
-            "strategy_risk_multiplier": _optional_float(getattr(row, "strategy_risk_multiplier", None)) or 1.0,
+            "signal_time": signal_contract.signal_time,
+            "desired_side": signal_contract.desired_side,
+            "stop_distance": signal_contract.risk_signal.stop_distance,
+            "stop_price": signal_contract.risk_signal.stop_price,
+            "side_changed": signal_contract.side_changed,
+            "strategy_score": signal_contract.alpha_signal.score,
+            "strategy_risk_multiplier": signal_contract.risk_signal.risk_multiplier,
+            "regime": signal_contract.alpha_signal.regime,
+            "route_key": signal_contract.route_key,
+            "alpha_side": signal_contract.alpha_signal.side,
         }
 
     return events
@@ -497,11 +523,16 @@ def _normalize_funding_frame(frame: pd.DataFrame) -> pd.DataFrame:
     normalized = frame.copy()
     normalized["timestamp"] = pd.to_datetime(normalized["timestamp"], utc=True)
     normalized["realized_rate"] = normalized["realized_rate"].astype(float)
-    return normalized[["timestamp", "realized_rate"]].sort_values("timestamp").reset_index(drop=True)
+    return (
+        normalized[["timestamp", "realized_rate"]]
+        .drop_duplicates(subset=["timestamp"], keep="last")
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
 
 
 def _normalize_signal_frame(frame: pd.DataFrame) -> pd.DataFrame:
-    normalized = frame.copy()
+    normalized = apply_signal_contract_columns(frame.copy())
     if "timestamp" not in normalized.columns:
         raise ValueError("signal_frame must contain a timestamp column")
     normalized["timestamp"] = pd.to_datetime(normalized["timestamp"], utc=True)
@@ -552,14 +583,97 @@ def _impact_rate(
     return bps / 10_000
 
 
+def _build_funding_events(
+    *,
+    execution_bars: pd.DataFrame,
+    funding_rates: pd.DataFrame,
+    interval_hours: int,
+) -> dict[pd.Timestamp, list[float | None]]:
+    schedule = sorted(_expected_funding_schedule(execution_bars, interval_hours))
+    if not schedule:
+        return {}
+
+    execution_index = pd.DatetimeIndex(execution_bars["timestamp"]).sort_values()
+    sorted_funding = funding_rates.sort_values("timestamp").reset_index(drop=True)
+    funding_index = pd.DatetimeIndex(sorted_funding["timestamp"])
+    funding_values = sorted_funding["realized_rate"].astype(float).tolist()
+    events: dict[pd.Timestamp, list[float | None]] = {}
+
+    for schedule_time in schedule:
+        apply_position = execution_index.searchsorted(schedule_time, side="left")
+        if apply_position >= len(execution_index):
+            continue
+        apply_timestamp = pd.Timestamp(execution_index[apply_position])
+        actual_rates = events.setdefault(apply_timestamp, [])
+        actual_rates.append(
+            _lookup_funding_rate_for_schedule(
+                schedule_time=schedule_time,
+                funding_index=funding_index,
+                funding_values=funding_values,
+            )
+        )
+
+    return events
+
+
+def _lookup_funding_rate_for_schedule(
+    *,
+    schedule_time: pd.Timestamp,
+    funding_index: pd.DatetimeIndex,
+    funding_values: list[float],
+) -> float | None:
+    if funding_index.empty:
+        return None
+
+    position = funding_index.searchsorted(schedule_time, side="left")
+    nearest_rate: float | None = None
+    nearest_delta: pd.Timedelta | None = None
+
+    for candidate_position in (position - 1, position):
+        if candidate_position < 0 or candidate_position >= len(funding_index):
+            continue
+        candidate_time = pd.Timestamp(funding_index[candidate_position])
+        delta = abs(candidate_time - schedule_time)
+        if delta > FUNDING_TIMESTAMP_TOLERANCE:
+            continue
+        if nearest_delta is None or delta < nearest_delta:
+            nearest_delta = delta
+            nearest_rate = float(funding_values[candidate_position])
+
+    return nearest_rate
+
+
+def _funding_change_for_event(
+    *,
+    side: int,
+    contracts: float,
+    contract_value: float,
+    price: float,
+    actual_rates: list[float | None],
+    fallback_rate_bps: float,
+) -> float:
+    return sum(
+        conservative_funding_change(
+            side=side,
+            contracts=contracts,
+            contract_value=contract_value,
+            price=price,
+            actual_rate=actual_rate,
+            fallback_rate_bps=fallback_rate_bps,
+        )
+        for actual_rate in actual_rates
+    )
+
+
 def _expected_funding_schedule(execution_bars: pd.DataFrame, interval_hours: int) -> set[pd.Timestamp]:
     if execution_bars.empty or interval_hours <= 0:
         return set()
-    start = pd.Timestamp(execution_bars["timestamp"].min()).floor(f"{interval_hours}h")
-    end = pd.Timestamp(execution_bars["timestamp"].max()).ceil(f"{interval_hours}h")
+    start = pd.Timestamp(execution_bars["timestamp"].min()).ceil(f"{interval_hours}h")
+    end = pd.Timestamp(execution_bars["timestamp"].max()).floor(f"{interval_hours}h")
+    if start > end:
+        return set()
     schedule = pd.date_range(start=start, end=end, freq=f"{interval_hours}h", tz="UTC")
-    execution_index = set(pd.DatetimeIndex(execution_bars["timestamp"]))
-    return {pd.Timestamp(ts) for ts in schedule if pd.Timestamp(ts) in execution_index}
+    return {pd.Timestamp(ts) for ts in schedule}
 
 
 def _optional_float(value) -> float | None:

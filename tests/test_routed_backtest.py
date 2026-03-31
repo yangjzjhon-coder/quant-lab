@@ -7,6 +7,7 @@ import pandas as pd
 from typer.testing import CliRunner
 
 from quant_lab.backtest.routed import run_routed_backtest
+from quant_lab.artifacts import read_artifact_manifest
 from quant_lab.cli import app
 from quant_lab.config import (
     AppConfig,
@@ -60,6 +61,62 @@ def test_run_routed_backtest_uses_candidate_for_mapped_bull_regime(tmp_path: Pat
     assert not routed.artifacts.equity_curve.empty
 
 
+def test_run_routed_backtest_surfaces_contract_fields_in_route_outputs(tmp_path: Path) -> None:
+    candidate_config = _write_candidate_config(tmp_path, variant="ema_cross")
+    config = _runtime_config(
+        tmp_path,
+        trading=TradingConfig(
+            strategy_router_enabled=True,
+            strategy_router_fallback_to_config=True,
+            execution_candidate_map={"bull_trend": 1},
+        ),
+    )
+    init_db(config.database.url)
+    session_factory = make_session_factory(config.database.url)
+    _insert_candidate(
+        session_factory=session_factory,
+        candidate_id=1,
+        candidate_name="btc_bull_router",
+        config_path=candidate_config,
+    )
+
+    routed = run_routed_backtest(
+        session_factory=session_factory,
+        config=config,
+        project_root=tmp_path,
+        symbol="BTC-USDT-SWAP",
+        signal_bars=_bull_signal_bars(),
+        execution_bars=_bull_execution_bars(),
+        funding_rates=_empty_funding(),
+        execution_config=config.execution,
+        risk_config=config.risk,
+        instrument_config=config.instrument,
+        required_scope="demo",
+    )
+
+    for column in (
+        "execution_desired_side",
+        "alpha_side",
+        "alpha_score",
+        "alpha_regime",
+        "risk_stop_distance",
+        "risk_stop_price",
+        "risk_multiplier",
+        "contract_strategy_name",
+        "contract_strategy_variant",
+    ):
+        assert column in routed.route_frame.columns
+        assert column in routed.artifacts.signal_frame.columns
+
+    latest = routed.route_frame.iloc[-1]
+    assert latest["execution_desired_side"] == latest["desired_side"]
+    assert latest["risk_stop_distance"] == latest["stop_distance"]
+    assert latest["risk_multiplier"] == latest["strategy_risk_multiplier"]
+    assert latest["contract_strategy_name"] == "ema_trend_4h"
+    assert latest["contract_strategy_variant"] == "ema_cross"
+    assert latest["alpha_regime"] == "bull_trend"
+
+
 def test_run_routed_backtest_falls_back_when_regime_route_is_missing(tmp_path: Path) -> None:
     candidate_config = _write_candidate_config(tmp_path, variant="ema_cross")
     config = _runtime_config(
@@ -97,6 +154,45 @@ def test_run_routed_backtest_falls_back_when_regime_route_is_missing(tmp_path: P
     assert routed.route_summary["route_status_counts"]["base_config_fallback"] == len(routed.route_frame)
     assert routed.route_frame["selected_strategy_source"].iloc[-1] == "base_config_fallback"
     assert routed.route_frame["selected_candidate_id"].isna().all()
+
+
+def test_run_routed_backtest_keeps_market_columns_for_dashboard_outputs(tmp_path: Path) -> None:
+    candidate_config = _write_candidate_config(tmp_path, variant="ema_cross")
+    config = _runtime_config(
+        tmp_path,
+        trading=TradingConfig(
+            strategy_router_enabled=True,
+            strategy_router_fallback_to_config=True,
+            execution_candidate_map={"bull_trend": 1},
+        ),
+    )
+    init_db(config.database.url)
+    session_factory = make_session_factory(config.database.url)
+    _insert_candidate(
+        session_factory=session_factory,
+        candidate_id=1,
+        candidate_name="btc_bull_router",
+        config_path=candidate_config,
+    )
+
+    routed = run_routed_backtest(
+        session_factory=session_factory,
+        config=config,
+        project_root=tmp_path,
+        symbol="BTC-USDT-SWAP",
+        signal_bars=_bull_signal_bars(),
+        execution_bars=_bull_execution_bars(),
+        funding_rates=_empty_funding(),
+        execution_config=config.execution,
+        risk_config=config.risk,
+        instrument_config=config.instrument,
+        required_scope="demo",
+    )
+
+    signal_frame = routed.artifacts.signal_frame
+    for column in ("open", "high", "low", "close"):
+        assert column in signal_frame.columns
+        assert signal_frame[column].notna().all()
 
 
 def test_research_routed_backtest_cli_writes_report_and_routing_artifacts(tmp_path: Path) -> None:
@@ -164,14 +260,24 @@ database:
     assert result.exit_code == 0
     report_dir = tmp_path / "data" / "reports"
     prefix = "BTC-USDT-SWAP_ema_trend_4h_routed"
-    assert (report_dir / f"{prefix}_summary.json").exists()
-    assert (report_dir / f"{prefix}_equity_curve.csv").exists()
-    assert (report_dir / f"{prefix}_trades.csv").exists()
-    assert (report_dir / f"{prefix}_dashboard.html").exists()
-    assert (report_dir / f"{prefix}_routes.csv").exists()
-    assert (report_dir / f"{prefix}_routing_summary.json").exists()
+    manifest = read_artifact_manifest(report_dir, prefix)
 
-    summary_payload = json.loads((report_dir / f"{prefix}_summary.json").read_text(encoding="utf-8"))
+    assert manifest is not None
+    assert manifest["artifact_kind"] == "routed_backtest"
+    assert manifest["logical_prefix"] == prefix
+
+    artifacts = manifest["artifacts"]
+    for key in ("summary", "equity_curve", "trades", "dashboard", "routes", "routing_summary"):
+        assert Path(artifacts[key]).exists()
+        assert "__" in Path(artifacts[key]).name
+
+    aliases = manifest["aliases"]
+    assert Path(aliases[f"{prefix}_summary.json"]).name == Path(artifacts["summary"]).name
+    assert Path(aliases[f"{prefix}_dashboard.html"]).name == Path(artifacts["dashboard"]).name
+    assert Path(aliases[f"{prefix}_routes.csv"]).name == Path(artifacts["routes"]).name
+    assert Path(aliases[f"{prefix}_routing_summary.json"]).name == Path(artifacts["routing_summary"]).name
+
+    summary_payload = json.loads(Path(artifacts["summary"]).read_text(encoding="utf-8"))
     assert summary_payload["routing_mode"] == "candidate_router"
     assert summary_payload["routing_candidate_bar_pct"] > 95.0
 

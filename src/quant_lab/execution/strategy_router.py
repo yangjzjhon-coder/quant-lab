@@ -9,6 +9,7 @@ import pandas as pd
 from quant_lab.config import AppConfig, StrategyConfig, configured_symbols, load_config
 from quant_lab.service.database import StrategyCandidate, session_scope
 from quant_lab.service.research_ops import serialize_strategy_candidate
+from quant_lab.strategy_contracts import normalize_regime_label
 
 
 @dataclass
@@ -31,23 +32,141 @@ class StrategyRouteDecision:
     strategy_config: StrategyConfig
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "enabled": self.enabled,
-            "ready": self.ready,
-            "symbol": self.symbol,
-            "regime": self.regime,
-            "route_key": self.route_key,
-            "required_scope": self.required_scope,
-            "fallback_used": self.fallback_used,
-            "selected_strategy_source": self.selected_strategy_source,
-            "selected_strategy_name": self.selected_strategy_name,
-            "selected_variant": self.selected_variant,
-            "selected_signal_bar": self.selected_signal_bar,
-            "selected_execution_bar": self.selected_execution_bar,
-            "candidate": self.candidate,
-            "reasons": self.reasons,
-            "regime_metrics": self.regime_metrics,
-        }
+        return serialize_strategy_route_decision(self)
+
+
+def serialize_strategy_route_decision(
+    decision: StrategyRouteDecision | dict[str, Any] | None,
+    *,
+    default_strategy: StrategyConfig | None = None,
+    symbol: str | None = None,
+    required_scope: str | None = None,
+) -> dict[str, Any]:
+    raw = _raw_route_decision_mapping(decision)
+    route_payload = raw.get("route") if isinstance(raw.get("route"), dict) else {}
+    selection_payload = raw.get("selection") if isinstance(raw.get("selection"), dict) else {}
+    display_payload = raw.get("display") if isinstance(raw.get("display"), dict) else {}
+    candidate = raw.get("candidate") if isinstance(raw.get("candidate"), dict) else None
+    enabled_value = raw.get("enabled")
+    if enabled_value is None:
+        enabled_value = bool(
+            route_payload
+            or selection_payload
+            or candidate
+            or _optional_text(raw.get("regime"))
+            or _optional_text(raw.get("route_key"))
+            or _optional_text(raw.get("selected_strategy_name"))
+            or _optional_text(raw.get("selected_variant"))
+            or raw.get("ready") is not None
+        )
+    ready_value = bool(raw.get("ready"))
+
+    resolved_symbol = _optional_text(raw.get("symbol")) or _optional_text(route_payload.get("symbol")) or symbol
+    resolved_regime = normalize_regime_label(route_payload.get("regime"))
+    if resolved_regime is None:
+        resolved_regime = normalize_regime_label(raw.get("regime"))
+    resolved_route_key = _optional_text(route_payload.get("route_key")) or _optional_text(raw.get("route_key"))
+    resolved_required_scope = (
+        _optional_text(route_payload.get("required_scope"))
+        or _optional_text(raw.get("required_scope"))
+        or required_scope
+        or "demo"
+    )
+    fallback_used = bool(
+        route_payload.get("fallback_used")
+        if "fallback_used" in route_payload
+        else raw.get("fallback_used")
+    )
+
+    selected_strategy_source = (
+        _optional_text(selection_payload.get("source"))
+        or _optional_text(raw.get("selected_strategy_source"))
+        or ("base_config" if not enabled_value else "unresolved")
+    )
+    selected_strategy_name = (
+        _optional_text(selection_payload.get("strategy_name"))
+        or _optional_text(raw.get("selected_strategy_name"))
+        or (default_strategy.name if default_strategy is not None else None)
+    )
+    selected_variant = (
+        _optional_text(selection_payload.get("strategy_variant"))
+        or _optional_text(raw.get("selected_variant"))
+        or (default_strategy.variant if default_strategy is not None else None)
+    )
+    selected_signal_bar = (
+        _optional_text(selection_payload.get("signal_bar"))
+        or _optional_text(raw.get("selected_signal_bar"))
+        or (default_strategy.signal_bar if default_strategy is not None else None)
+    )
+    selected_execution_bar = (
+        _optional_text(selection_payload.get("execution_bar"))
+        or _optional_text(raw.get("selected_execution_bar"))
+        or (default_strategy.execution_bar if default_strategy is not None else None)
+    )
+
+    reasons = [str(item) for item in (raw.get("reasons") or []) if str(item).strip()]
+    regime_metrics = raw.get("regime_metrics") if isinstance(raw.get("regime_metrics"), dict) else {}
+    candidate_name = _optional_text(display_payload.get("candidate_name"))
+    if candidate_name is None and isinstance(candidate, dict):
+        candidate_name = _optional_text(candidate.get("candidate_name"))
+
+    route_label = _optional_text(display_payload.get("route_label")) or _route_display_label(
+        symbol=resolved_symbol,
+        regime=resolved_regime,
+        route_key=resolved_route_key,
+    )
+    selection_label = _optional_text(display_payload.get("selection_label")) or _selection_display_label(
+        strategy_name=selected_strategy_name,
+        strategy_variant=selected_variant,
+        signal_bar=selected_signal_bar,
+        execution_bar=selected_execution_bar,
+    )
+    status_label = _optional_text(display_payload.get("status_label")) or _route_status_label(
+        enabled=enabled_value,
+        ready=ready_value,
+        fallback_used=fallback_used,
+        selected_strategy_source=selected_strategy_source,
+    )
+
+    return {
+        "enabled": enabled_value,
+        "ready": ready_value,
+        "symbol": resolved_symbol,
+        "regime": resolved_regime,
+        "route_key": resolved_route_key,
+        "required_scope": resolved_required_scope,
+        "fallback_used": fallback_used,
+        "selected_strategy_source": selected_strategy_source,
+        "selected_strategy_name": selected_strategy_name,
+        "selected_variant": selected_variant,
+        "selected_signal_bar": selected_signal_bar,
+        "selected_execution_bar": selected_execution_bar,
+        "candidate": candidate,
+        "reasons": reasons,
+        "regime_metrics": regime_metrics,
+        "route": {
+            "symbol": resolved_symbol,
+            "regime": resolved_regime,
+            "route_key": resolved_route_key,
+            "required_scope": resolved_required_scope,
+            "fallback_used": fallback_used,
+            "label": route_label,
+        },
+        "selection": {
+            "source": selected_strategy_source,
+            "strategy_name": selected_strategy_name,
+            "strategy_variant": selected_variant,
+            "signal_bar": selected_signal_bar,
+            "execution_bar": selected_execution_bar,
+            "label": selection_label,
+        },
+        "display": {
+            "route_label": route_label,
+            "selection_label": selection_label,
+            "status_label": status_label,
+            "candidate_name": candidate_name,
+        },
+    }
 
 
 def build_strategy_router_status(*, session_factory, config: AppConfig, required_scope: str = "demo") -> dict[str, Any]:
@@ -98,6 +217,11 @@ def build_strategy_router_status(*, session_factory, config: AppConfig, required
                     "candidate": payload,
                     "ready": not entry_reasons,
                     "reasons": entry_reasons,
+                    "display": {
+                        "route_label": route_key,
+                        "candidate_name": payload.get("candidate_name") if isinstance(payload, dict) else None,
+                        "reason_text": "; ".join(entry_reasons),
+                    },
                 }
             )
             reasons.extend(f"{route_key}: {item}" for item in entry_reasons)
@@ -373,3 +497,81 @@ def _scope_allows(candidate_scope: str | None, required_scope: str) -> bool:
     if required == "demo" and candidate == "live":
         return True
     return False
+
+
+def _raw_route_decision_mapping(decision: StrategyRouteDecision | dict[str, Any] | None) -> dict[str, Any]:
+    if isinstance(decision, StrategyRouteDecision):
+        return {
+            "enabled": decision.enabled,
+            "ready": decision.ready,
+            "symbol": decision.symbol,
+            "regime": decision.regime,
+            "route_key": decision.route_key,
+            "required_scope": decision.required_scope,
+            "fallback_used": decision.fallback_used,
+            "selected_strategy_source": decision.selected_strategy_source,
+            "selected_strategy_name": decision.selected_strategy_name,
+            "selected_variant": decision.selected_variant,
+            "selected_signal_bar": decision.selected_signal_bar,
+            "selected_execution_bar": decision.selected_execution_bar,
+            "candidate": decision.candidate,
+            "reasons": decision.reasons,
+            "regime_metrics": decision.regime_metrics,
+        }
+    if isinstance(decision, dict):
+        return dict(decision)
+    return {}
+
+
+def _optional_text(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _route_display_label(*, symbol: str | None, regime: str | None, route_key: str | None) -> str:
+    if route_key:
+        return route_key
+    if symbol and regime:
+        return f"{symbol}:{regime}"
+    if regime:
+        return regime
+    if symbol:
+        return symbol
+    return "unresolved"
+
+
+def _selection_display_label(
+    *,
+    strategy_name: str | None,
+    strategy_variant: str | None,
+    signal_bar: str | None,
+    execution_bar: str | None,
+) -> str:
+    strategy_bits = " / ".join(
+        [item for item in (strategy_name, strategy_variant) if item]
+    ) or "unresolved"
+    if signal_bar and execution_bar:
+        return f"{strategy_bits} @ {signal_bar}->{execution_bar}"
+    if signal_bar:
+        return f"{strategy_bits} @ {signal_bar}"
+    return strategy_bits
+
+
+def _route_status_label(
+    *,
+    enabled: bool,
+    ready: bool,
+    fallback_used: bool,
+    selected_strategy_source: str | None,
+) -> str:
+    if not enabled:
+        return "router_disabled"
+    if ready:
+        return "route_ready"
+    if fallback_used:
+        return "fallback_active"
+    if selected_strategy_source == "candidate_config":
+        return "candidate_blocked"
+    return "route_blocked"

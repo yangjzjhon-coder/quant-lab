@@ -7,9 +7,10 @@ from itertools import product
 import pandas as pd
 
 from quant_lab.backtest.engine import (
+    _build_funding_events,
     _build_signal_events,
-    _expected_funding_schedule,
     _exit_fill_price,
+    _funding_change_for_event,
     _impact_rate,
     _initial_stop_price,
     _entry_fill_price,
@@ -23,7 +24,6 @@ from quant_lab.backtest.engine import (
 from quant_lab.backtest.realism import (
     bar_liquidity_quote,
     cap_contracts_by_liquidity,
-    conservative_funding_change,
 )
 from quant_lab.config import ExecutionConfig, InstrumentConfig, RiskConfig, StrategyConfig
 from quant_lab.models import Position
@@ -115,8 +115,11 @@ def _run_backtest_summary_only(
         strategy_config.signal_bar,
         execution_config.latency_minutes,
     )
-    funding_lookup = {row.timestamp: row.realized_rate for row in funding_rates.itertuples(index=False)}
-    funding_schedule = _expected_funding_schedule(execution_bars, execution_config.funding_interval_hours)
+    funding_events = _build_funding_events(
+        execution_bars=execution_bars,
+        funding_rates=funding_rates,
+        interval_hours=execution_config.funding_interval_hours,
+    )
 
     fee_rate = execution_config.fee_bps / 10_000
 
@@ -148,13 +151,14 @@ def _run_backtest_summary_only(
             volume_quote=_optional_float(getattr(bar, "volume_quote", None)),
         )
 
-        if position is not None and timestamp in funding_schedule:
-            funding_change = conservative_funding_change(
+        funding_event = funding_events.get(timestamp)
+        if position is not None and funding_event is not None:
+            funding_change = _funding_change_for_event(
                 side=position.side,
                 contracts=position.contracts,
                 contract_value=position.contract_value,
                 price=bar_open,
-                actual_rate=funding_lookup.get(timestamp),
+                actual_rates=funding_event,
                 fallback_rate_bps=execution_config.missing_funding_rate_bps,
             )
             cash += funding_change

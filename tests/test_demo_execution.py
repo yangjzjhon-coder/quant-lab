@@ -40,6 +40,10 @@ def test_build_signal_snapshot_waits_for_latency_window() -> None:
     assert signal.desired_side == 1
     assert signal.ready is False
     assert signal.effective_time == last_signal_time + pd.Timedelta(hours=4, minutes=1)
+    assert signal.alpha_signal is not None
+    assert signal.risk_signal is not None
+    assert signal.alpha_signal.side == 1
+    assert signal.risk_signal.stop_distance == signal.stop_distance
 
 
 def test_build_order_plan_opens_long_from_flat() -> None:

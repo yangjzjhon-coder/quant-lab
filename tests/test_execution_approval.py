@@ -113,7 +113,7 @@ def test_research_bind_candidate_updates_trading_section_in_yaml(tmp_path: Path)
     assert "execution_candidate_id: 12" in updated
 
 
-def test_runtime_preflight_accepts_valid_strategy_router_pool(tmp_path: Path) -> None:
+def test_runtime_preflight_accepts_valid_strategy_router_pool(tmp_path: Path, monkeypatch) -> None:
     config = _runtime_config(
         tmp_path,
         trading=TradingConfig(
@@ -147,6 +147,29 @@ def test_runtime_preflight_accepts_valid_strategy_router_pool(tmp_path: Path) ->
             )
         )
 
+    monkeypatch.setattr(
+        "quant_lab.service.demo_runtime.build_runtime_route_decisions",
+        lambda **kwargs: {
+            "BTC-USDT-SWAP": {
+                "enabled": True,
+                "ready": True,
+                "symbol": "BTC-USDT-SWAP",
+                "regime": "bull_trend",
+                "route_key": "bull_trend",
+                "required_scope": "demo",
+                "fallback_used": False,
+                "selected_strategy_source": "candidate_config",
+                "selected_strategy_name": "ema_trend_4h",
+                "selected_variant": "ema_cross",
+                "selected_signal_bar": "4H",
+                "selected_execution_bar": "1m",
+                "candidate": {"id": 7, "candidate_name": "btc_router_candidate"},
+                "reasons": [],
+                "regime_metrics": {},
+            }
+        },
+    )
+
     app_instance = build_service_app(config=config, session_factory=session_factory, project_root=tmp_path)
     with TestClient(app_instance) as client:
         response = client.get("/runtime/preflight")
@@ -157,6 +180,10 @@ def test_runtime_preflight_accepts_valid_strategy_router_pool(tmp_path: Path) ->
         assert payload["execution_approval"]["ready"] is True
         assert payload["strategy_router"]["enabled"] is True
         assert payload["strategy_router"]["routes"][0]["route_key"] == "bull_trend"
+        route_decision = payload["execution_approval"]["route_decisions"]["BTC-USDT-SWAP"]
+        assert route_decision["route"]["label"] == "bull_trend"
+        assert route_decision["selection"]["strategy_name"] == "ema_trend_4h"
+        assert route_decision["display"]["status_label"] == "route_ready"
 
 
 def _runtime_config(tmp_path: Path, *, trading: TradingConfig) -> AppConfig:

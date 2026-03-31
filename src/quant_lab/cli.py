@@ -12,10 +12,45 @@ import typer
 import uvicorn
 
 from quant_lab.alerts.delivery import deliver_alerts
+from quant_lab.errors import normalize_error
+from quant_lab.logging_utils import configure_logging, get_logger
+from quant_lab.application import demo_support, report_runtime
+from quant_lab.application.runtime_policy import aggregate_execution_loop_status
+from quant_lab.application.project_tasks import (
+    DEFAULT_PROJECT_RESEARCH_ADX,
+    DEFAULT_PROJECT_RESEARCH_ATR,
+    DEFAULT_PROJECT_RESEARCH_FAST,
+    DEFAULT_PROJECT_RESEARCH_SLOW,
+    DEFAULT_PROJECT_RESEARCH_TREND_EMA,
+    DEFAULT_PROJECT_RESEARCH_VARIANTS,
+    DEFAULT_PROJECT_SWEEP_ATR,
+    DEFAULT_PROJECT_SWEEP_FAST,
+    DEFAULT_PROJECT_SWEEP_SLOW,
+    default_project_research_report_prefix,
+    resolve_project_research_results_path,
+)
+from quant_lab.artifacts import (
+    artifact_resolution_path,
+    backtest_artifact_identity,
+    backtest_artifact_resolution as resolve_backtest_artifact_group,
+    backtest_sleeve_artifact_identity,
+    sleeve_backtest_artifact_resolution as resolve_sleeve_backtest_artifact_group,
+    canonical_artifact_path,
+    canonical_artifact_paths,
+    register_artifact_group,
+    routed_backtest_artifact_identity,
+    routed_backtest_sleeve_artifact_identity,
+    sweep_artifact_identity,
+    sweep_artifact_resolution as resolve_sweep_artifact_group,
+    trend_research_artifact_identity,
+)
 from quant_lab.backtest.engine import run_backtest
 from quant_lab.backtest.metrics import build_summary
 from quant_lab.backtest.portfolio import (
+    attach_equal_weight_portfolio_construction,
+    attach_portfolio_risk_budget_overlay,
     build_portfolio_summary,
+    build_portfolio_risk_budget_overlay,
     build_portfolio_trade_frame,
     combine_portfolio_equity_curves,
 )
@@ -32,7 +67,7 @@ from quant_lab.config import (
 )
 from quant_lab.data.public_factors import PublicFactorSnapshot, load_public_factor_snapshot
 from quant_lab.data.okx_private_client import OkxPrivateClient
-from quant_lab.data.okx_public_client import OkxApiError, OkxPublicClient
+from quant_lab.data.okx_public_client import OkxApiError
 from quant_lab.execution.planner import (
     AccountSnapshot,
     OrderPlan,
@@ -44,13 +79,35 @@ from quant_lab.execution.planner import (
     extract_okx_max_size,
 )
 from quant_lab.execution.strategy_router import resolve_strategy_route
-from quant_lab.models import TradeRecord
+from quant_lab.models import BacktestArtifacts, TradeRecord
 from quant_lab.reporting.dashboard import render_dashboard
 from quant_lab.reporting.sweep_dashboard import render_sweep_dashboard
 from quant_lab.reporting.trend_research_dashboard import render_trend_research_dashboard
 from quant_lab.risk.portfolio import apply_factor_overlay_to_plan, apply_portfolio_risk_caps
+from quant_lab.providers.market_data import build_market_data_provider, market_data_provider_name
 from quant_lab.service.database import AlertEvent, ServiceHeartbeat, init_db, make_session_factory, session_scope
-from quant_lab.service.monitor import build_preflight_payload, build_service_app, run_monitor_cycle
+from quant_lab.service.demo_runtime import (
+    build_portfolio_demo_heartbeat_details as runtime_build_portfolio_demo_heartbeat_details,
+    build_preflight_payload as runtime_build_preflight_payload,
+    build_execution_approval_payload as runtime_execution_approval_payload,
+    build_single_demo_heartbeat_details as runtime_build_single_demo_heartbeat_details,
+    build_submit_gate_payload as runtime_submit_gate_payload,
+    demo_mode as runtime_demo_mode,
+    executor_state_path as runtime_executor_state_path,
+    heartbeat_service_name as runtime_heartbeat_service_name,
+    load_executor_state_info as runtime_load_executor_state_info,
+    reset_executor_state as runtime_reset_executor_state,
+    run_align_leverage_action as runtime_run_align_leverage_action,
+    save_executor_state as runtime_save_executor_state,
+)
+from quant_lab.service.integrations import build_integration_overview
+from quant_lab.service.market_data import build_market_data_status
+from quant_lab.service.monitor import build_service_app, run_monitor_cycle
+from quant_lab.service.research_agent import (
+    ResearchAgentRequest,
+    build_research_agent_status,
+    run_research_agent_workflow,
+)
 from quant_lab.service.research_ai import ResearchAIRequest, build_research_ai_status, run_research_ai_request
 from quant_lab.service.research_ops import (
     approve_strategy_candidate,
@@ -75,13 +132,52 @@ from quant_lab.service.research_ops import (
 from quant_lab.utils.timeframes import bar_to_timedelta as parse_bar_timedelta
 
 app = typer.Typer(help="Local crypto backtesting toolkit for realistic OKX trend and breakout systems.")
+LOGGER = get_logger(__name__)
+
+
+def build_preflight_payload(config, session_factory, project_root: Path) -> dict[str, Any]:
+    return runtime_build_preflight_payload(
+        config=config,
+        session_factory=session_factory,
+        project_root=project_root,
+    )
+
+
+def _cli_error_payload(exc: Exception, *, command: str) -> dict[str, Any]:
+    payload = normalize_error(exc).to_payload()
+    payload["command"] = command
+    payload["source"] = "cli"
+    return payload
+
+
+def _raise_cli_json_error(exc: Exception, *, command: str) -> None:
+    typer.echo(json.dumps(_cli_error_payload(exc, command=command), ensure_ascii=False, indent=2))
+    raise typer.Exit(code=1)
+
+
+def _run_cli_json_command(command: str, fn: Callable[[], None]) -> None:
+    try:
+        fn()
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        _raise_cli_json_error(exc, command=command)
+
+
+def _parse_context_json_option(context_json: str | None) -> dict[str, Any]:
+    if not context_json:
+        return {}
+    try:
+        parsed = json.loads(context_json)
+    except json.JSONDecodeError as exc:
+        raise typer.BadParameter(f"Invalid --context-json payload: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise typer.BadParameter("--context-json must decode into a JSON object.")
+    return parsed
 
 
 def _trades_frame(trades: list[TradeRecord]) -> pd.DataFrame:
-    columns = [field.name for field in fields(TradeRecord)]
-    if not trades:
-        return pd.DataFrame(columns=columns)
-    return pd.DataFrame([trade.to_dict() for trade in trades], columns=columns)
+    return report_runtime.trades_frame(trades)
 
 
 def _write_backtest_artifacts(
@@ -91,15 +187,22 @@ def _write_backtest_artifacts(
     trades_frame: pd.DataFrame,
     equity_curve: pd.DataFrame,
     summary: dict[str, object],
+    allocation_overlay: pd.DataFrame | None = None,
+    signal_frame: pd.DataFrame | None = None,
+    execution_bars: pd.DataFrame | None = None,
+    artifact_identity: dict[str, Any] | None = None,
 ) -> tuple[Path, Path, Path]:
-    trades_path = storage.report_dir / f"{report_prefix}_trades.csv"
-    equity_path = storage.report_dir / f"{report_prefix}_equity_curve.csv"
-    summary_path = storage.report_dir / f"{report_prefix}_summary.json"
-
-    trades_frame.to_csv(trades_path, index=False)
-    equity_curve.to_csv(equity_path, index=False)
-    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    return trades_path, equity_path, summary_path
+    return report_runtime.write_backtest_artifacts(
+        storage=storage,
+        report_prefix=report_prefix,
+        trades_frame=trades_frame,
+        equity_curve=equity_curve,
+        summary=summary,
+        allocation_overlay=allocation_overlay,
+        signal_frame=signal_frame,
+        execution_bars=execution_bars,
+        artifact_identity=artifact_identity,
+    )
 
 
 def _write_routing_artifacts(
@@ -108,30 +211,22 @@ def _write_routing_artifacts(
     report_prefix: str,
     route_frame: pd.DataFrame,
     route_summary: dict[str, object],
+    artifact_identity: dict[str, Any] | None = None,
 ) -> tuple[Path, Path]:
-    route_path = storage.report_dir / f"{report_prefix}_routes.csv"
-    route_summary_path = storage.report_dir / f"{report_prefix}_routing_summary.json"
-    route_frame.to_csv(route_path, index=False)
-    route_summary_path.write_text(json.dumps(route_summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    return route_path, route_summary_path
+    return report_runtime.write_routing_artifacts(
+        storage=storage,
+        report_prefix=report_prefix,
+        route_frame=route_frame,
+        route_summary=route_summary,
+        artifact_identity=artifact_identity,
+    )
 
 
 def _load_report_inputs(
     config: Path,
     project_root: Path,
 ) -> tuple[object, object, pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
-    cfg = load_config(config)
-    storage = cfg.storage.resolved(project_root.resolve())
-    ensure_storage_dirs(storage)
-    symbol = cfg.instrument.symbol
-    signal_bars, execution_bars, funding, symbol_slug = _load_symbol_datasets(
-        storage=storage,
-        symbol=symbol,
-        signal_bar=cfg.strategy.signal_bar,
-        execution_bar=cfg.strategy.execution_bar,
-        variant=cfg.strategy.variant,
-    )
-    return cfg, storage, signal_bars, execution_bars, funding, symbol_slug
+    return report_runtime.load_report_inputs(config, project_root)
 
 
 def _load_symbol_report_inputs(
@@ -140,16 +235,7 @@ def _load_symbol_report_inputs(
     project_root: Path,
     symbol: str,
 ) -> tuple[object, object, pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
-    storage = cfg.storage.resolved(project_root.resolve())
-    ensure_storage_dirs(storage)
-    signal_bars, execution_bars, funding, symbol_slug = _load_symbol_datasets(
-        storage=storage,
-        symbol=symbol,
-        signal_bar=cfg.strategy.signal_bar,
-        execution_bar=cfg.strategy.execution_bar,
-        variant=cfg.strategy.variant,
-    )
-    return cfg, storage, signal_bars, execution_bars, funding, symbol_slug
+    return report_runtime.load_symbol_report_inputs(cfg=cfg, project_root=project_root, symbol=symbol)
 
 
 def _load_symbol_routed_report_inputs(
@@ -158,17 +244,7 @@ def _load_symbol_routed_report_inputs(
     project_root: Path,
     symbol: str,
 ) -> tuple[object, object, pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
-    cfg, storage, signal_bars, execution_bars, funding, symbol_slug = _load_symbol_report_inputs(
-        cfg=cfg,
-        project_root=project_root,
-        symbol=symbol,
-    )
-    signal_bars = _enrich_signal_bars_for_high_weight_strategy(
-        signal_bars=signal_bars,
-        mark_price_bars=_read_parquet_if_exists(storage.raw_dir / f"{symbol_slug}_mark_price_{cfg.strategy.signal_bar}.parquet"),
-        index_bars=_read_parquet_if_exists(storage.raw_dir / f"{symbol_slug}_index_{cfg.strategy.signal_bar}.parquet"),
-    )
-    return cfg, storage, signal_bars, execution_bars, funding, symbol_slug
+    return report_runtime.load_symbol_routed_report_inputs(cfg=cfg, project_root=project_root, symbol=symbol)
 
 
 def _load_symbol_datasets(
@@ -179,30 +255,13 @@ def _load_symbol_datasets(
     execution_bar: str,
     variant: str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
-    symbol_slug = _symbol_slug(symbol)
-    signal_path = storage.raw_dir / f"{symbol_slug}_{signal_bar}.parquet"
-    execution_path = storage.raw_dir / f"{symbol_slug}_{execution_bar}.parquet"
-    funding_path = storage.raw_dir / f"{symbol_slug}_funding.parquet"
-
-    for path in (signal_path, execution_path, funding_path):
-        if not path.exists():
-            raise typer.BadParameter(f"Missing required dataset: {path}")
-
-    signal_bars = pd.read_parquet(signal_path)
-    execution_bars = pd.read_parquet(execution_path)
-    funding = pd.read_parquet(funding_path)
-    if (variant or "").strip().lower() in {
-        "high_weight_long",
-        "trend_regime_long",
-        "trend_pullback_long",
-        "trend_breakout_long",
-    }:
-        signal_bars = _enrich_signal_bars_for_high_weight_strategy(
-            signal_bars=signal_bars,
-            mark_price_bars=_read_parquet_if_exists(storage.raw_dir / f"{symbol_slug}_mark_price_{signal_bar}.parquet"),
-            index_bars=_read_parquet_if_exists(storage.raw_dir / f"{symbol_slug}_index_{signal_bar}.parquet"),
-        )
-    return signal_bars, execution_bars, funding, symbol_slug
+    return report_runtime.load_symbol_datasets(
+        storage=storage,
+        symbol=symbol,
+        signal_bar=signal_bar,
+        execution_bar=execution_bar,
+        variant=variant,
+    )
 
 
 def _load_runtime_context(config: Path, project_root: Path):
@@ -217,11 +276,12 @@ def _load_app_context(config: Path, project_root: Path):
     cfg.storage = storage
     cfg.database = cfg.database.resolved(project_root.resolve())
     ensure_storage_dirs(storage)
+    configure_logging(project_root=project_root.resolve())
     return cfg
 
 
 def _symbol_slug(symbol: str) -> str:
-    return symbol.replace("/", "-")
+    return report_runtime.symbol_slug(symbol)
 
 
 def _symbol_list_label(symbols: list[str]) -> str:
@@ -229,29 +289,49 @@ def _symbol_list_label(symbols: list[str]) -> str:
 
 
 def _portfolio_report_prefix(symbols: list[str], strategy_name: str) -> str:
-    base_assets = "_".join(symbol.split("-")[0].lower() for symbol in symbols)
-    return f"portfolio_{base_assets}_{strategy_name}"
+    return report_runtime.portfolio_report_prefix(symbols, strategy_name)
+
+
+def _backtest_artifact_resolution(cfg, project_root: Path, resolved_symbols: list[str]) -> tuple[dict[str, Any], dict[str, Any]]:
+    return resolve_backtest_artifact_group(
+        config=cfg,
+        project_root=project_root,
+        symbols=resolved_symbols,
+    )
+
+
+def _sleeve_backtest_artifact_resolution(
+    cfg,
+    project_root: Path,
+    portfolio_symbols: list[str],
+    symbol: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    return resolve_sleeve_backtest_artifact_group(
+        config=cfg,
+        project_root=project_root,
+        portfolio_symbols=portfolio_symbols,
+        symbol=symbol,
+    )
+
+
+def _sweep_artifact_resolution(cfg, project_root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    return resolve_sweep_artifact_group(config=cfg, project_root=project_root)
+
+
+def _artifact_resolution_path(resolution: dict[str, Any], key: str, fallback: Path) -> Path:
+    return artifact_resolution_path(resolution, key, fallback)
 
 
 def _parse_int_list(raw: str) -> list[int]:
-    values = [int(chunk.strip()) for chunk in raw.split(",") if chunk.strip()]
-    if not values:
-        raise typer.BadParameter("Expected at least one integer value.")
-    return values
+    return report_runtime.parse_int_list(raw)
 
 
 def _parse_float_list(raw: str) -> list[float]:
-    values = [float(chunk.strip()) for chunk in raw.split(",") if chunk.strip()]
-    if not values:
-        raise typer.BadParameter("Expected at least one float value.")
-    return values
+    return report_runtime.parse_float_list(raw)
 
 
 def _parse_text_list(raw: str) -> list[str]:
-    values = [chunk.strip() for chunk in raw.split(",") if chunk.strip()]
-    if not values:
-        raise typer.BadParameter("Expected at least one text value.")
-    return values
+    return report_runtime.parse_text_list(raw)
 
 
 def _attach_routing_summary(summary: dict[str, object], route_summary: dict[str, object]) -> dict[str, object]:
@@ -273,7 +353,7 @@ def _resolve_symbols(cfg, raw_symbols: str | None) -> list[str]:
 
 
 def _instrument_metadata_path(storage, symbol: str) -> Path:
-    return storage.raw_dir / f"{_symbol_slug(symbol)}_instrument.json"
+    return report_runtime.instrument_metadata_path(storage, symbol)
 
 
 def _index_inst_id(symbol: str) -> str:
@@ -284,9 +364,7 @@ def _index_inst_id(symbol: str) -> str:
 
 
 def _read_parquet_if_exists(path: Path) -> pd.DataFrame:
-    if not path.exists():
-        return pd.DataFrame()
-    return pd.read_parquet(path)
+    return report_runtime.read_parquet_if_exists(path)
 
 
 def _enrich_signal_bars_for_high_weight_strategy(
@@ -295,11 +373,11 @@ def _enrich_signal_bars_for_high_weight_strategy(
     mark_price_bars: pd.DataFrame,
     index_bars: pd.DataFrame,
 ) -> pd.DataFrame:
-    enriched = signal_bars.copy()
-    enriched["timestamp"] = pd.to_datetime(enriched["timestamp"], utc=True)
-    enriched = _merge_reference_close(enriched, mark_price_bars, target_column="mark_close")
-    enriched = _merge_reference_close(enriched, index_bars, target_column="index_close")
-    return enriched
+    return report_runtime.enrich_signal_bars_for_high_weight_strategy(
+        signal_bars=signal_bars,
+        mark_price_bars=mark_price_bars,
+        index_bars=index_bars,
+    )
 
 
 def _merge_reference_close(
@@ -308,15 +386,7 @@ def _merge_reference_close(
     *,
     target_column: str,
 ) -> pd.DataFrame:
-    if reference.empty or "timestamp" not in reference.columns or "close" not in reference.columns:
-        return frame
-
-    prepared = frame.sort_values("timestamp").copy()
-    lookup = reference[["timestamp", "close"]].copy()
-    lookup["timestamp"] = pd.to_datetime(lookup["timestamp"], utc=True)
-    lookup["close"] = pd.to_numeric(lookup["close"], errors="coerce")
-    lookup = lookup.dropna(subset=["timestamp"]).sort_values("timestamp").rename(columns={"close": target_column})
-    return pd.merge_asof(prepared, lookup, on="timestamp", direction="backward")
+    return report_runtime.merge_reference_close(frame, reference, target_column=target_column)
 
 
 def _merge_deduped_frame(
@@ -424,25 +494,7 @@ def _load_symbol_public_factor_snapshot(
 
 
 def _resolve_instrument_config(cfg, storage, symbol: str) -> InstrumentConfig:
-    if symbol == cfg.instrument.symbol:
-        return cfg.instrument
-
-    metadata_path = _instrument_metadata_path(storage, symbol)
-    if metadata_path.exists():
-        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-        return InstrumentConfig.model_validate(payload)
-
-    client = OkxPublicClient(base_url=cfg.okx.rest_base_url, proxy_url=cfg.okx.proxy_url)
-    try:
-        instrument = client.fetch_instrument_details(
-            inst_type=cfg.instrument.instrument_type,
-            inst_id=symbol,
-        )
-    finally:
-        client.close()
-
-    metadata_path.write_text(json.dumps(instrument, ensure_ascii=False, indent=2), encoding="utf-8")
-    return InstrumentConfig.model_validate(instrument)
+    return report_runtime.resolve_instrument_config(cfg, storage, symbol)
 
 
 def _require_private_credentials(cfg) -> None:
@@ -486,36 +538,7 @@ def _fetch_live_market_data(cfg) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def _fetch_live_market_data_for_symbol(cfg, symbol: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    now = pd.Timestamp.now(tz="UTC")
-    signal_bars_needed = max(
-        cfg.trading.signal_lookback_bars,
-        cfg.strategy.slow_ema + cfg.strategy.atr_period + 10,
-    )
-    execution_bars_needed = max(cfg.trading.execution_lookback_bars, cfg.execution.latency_minutes + 20)
-
-    signal_start = now - (_bar_to_timedelta(cfg.strategy.signal_bar) * signal_bars_needed)
-    execution_start = now - (_bar_to_timedelta(cfg.strategy.execution_bar) * execution_bars_needed)
-
-    client = OkxPublicClient(base_url=cfg.okx.rest_base_url, proxy_url=cfg.okx.proxy_url)
-    try:
-        signal_bars = client.fetch_history_candles(
-            inst_id=symbol,
-            bar=cfg.strategy.signal_bar,
-            start=signal_start,
-            end=now,
-        )
-        execution_bars = client.fetch_history_candles(
-            inst_id=symbol,
-            bar=cfg.strategy.execution_bar,
-            start=execution_start,
-            end=now,
-        )
-    finally:
-        client.close()
-
-    if signal_bars.empty or execution_bars.empty:
-        raise typer.BadParameter("Unable to fetch enough recent market data for demo planning.")
-    return signal_bars, execution_bars
+    return demo_support.fetch_live_market_data_for_symbol(cfg, symbol)
 
 
 def _load_demo_state(
@@ -524,9 +547,8 @@ def _load_demo_state(
     session_factory=None,
     project_root: Path | None = None,
 ) -> tuple[AccountSnapshot, PositionSnapshot, dict[str, object]]:
-    return _load_demo_state_for_symbol(
+    return demo_support.load_demo_state(
         cfg,
-        cfg.instrument.symbol,
         session_factory=session_factory,
         project_root=project_root,
     )
@@ -543,143 +565,16 @@ def _load_demo_state_for_symbol(
     shared_account_config_payload: dict[str, object] | None = None,
     allocated_equity: float | None = None,
 ) -> tuple[AccountSnapshot, PositionSnapshot, dict[str, object]]:
-    instrument_config = _resolve_instrument_config(cfg, cfg.storage, symbol)
-    signal_bars, execution_bars = _fetch_live_market_data_for_symbol(cfg, symbol)
-    router_decision = None
-    strategy_config_for_signal = cfg.strategy
-    if session_factory is not None and project_root is not None:
-        router_decision = resolve_strategy_route(
-            session_factory=session_factory,
-            config=cfg,
-            project_root=project_root,
-            symbol=symbol,
-            signal_bars=signal_bars,
-            required_scope="demo",
-        )
-        strategy_config_for_signal = router_decision.strategy_config
-    signal = build_signal_snapshot(
-        signal_bars=signal_bars,
-        execution_bars=execution_bars,
-        strategy_config=strategy_config_for_signal,
-        execution_config=cfg.execution,
+    return demo_support.load_demo_state_for_symbol(
+        cfg,
+        symbol,
+        session_factory=session_factory,
+        project_root=project_root,
+        private_client=private_client,
+        shared_balance_payload=shared_balance_payload,
+        shared_account_config_payload=shared_account_config_payload,
+        allocated_equity=allocated_equity,
     )
-
-    balance_payload = None
-    positions_payload = None
-    account_config_payload = None
-    max_size_payload = None
-    leverage_payload = None
-    pending_orders_payload = None
-    pending_algo_orders_payload = None
-    warnings: list[str] = []
-
-    owns_client = False
-    if cfg.okx.api_key and cfg.okx.secret_key and cfg.okx.passphrase:
-        if private_client is None:
-            private_client = _build_private_client(cfg)
-            owns_client = True
-        try:
-            account_config_payload = shared_account_config_payload or private_client.get_account_config()
-            balance_payload = shared_balance_payload or private_client.get_balance(ccy=instrument_config.settle_currency)
-            positions_payload = private_client.get_positions(
-                inst_type=instrument_config.instrument_type,
-                inst_id=symbol,
-            )
-            max_size_payload = private_client.get_max_order_size(
-                inst_id=symbol,
-                td_mode=cfg.trading.td_mode,
-                ccy=instrument_config.settle_currency,
-                leverage=cfg.execution.max_leverage,
-            )
-            leverage_payload = private_client.get_leverage_info(
-                inst_id=symbol,
-                mgn_mode=cfg.trading.td_mode,
-            )
-            pending_orders_payload = private_client.get_pending_orders(
-                inst_type=instrument_config.instrument_type,
-                inst_id=symbol,
-            )
-            pending_algo_orders_payload = private_client.get_pending_algo_orders(
-                inst_id=symbol,
-                ord_type="conditional",
-            )
-        finally:
-            if owns_client:
-                private_client.close()
-    else:
-        warnings.append("Private OKX credentials are missing. Plan falls back to config equity and flat position.")
-
-    account = build_account_snapshot(
-        balance_payload=balance_payload,
-        account_config_payload=account_config_payload,
-        settle_currency=instrument_config.settle_currency,
-        fallback_equity=cfg.execution.initial_equity,
-    )
-    planning_account = account
-    if allocated_equity is not None and allocated_equity > 0:
-        allocated_value = min(allocated_equity, account.available_equity or allocated_equity)
-        planning_account = AccountSnapshot(
-            total_equity=allocated_value,
-            available_equity=allocated_value,
-            currency=account.currency,
-            source=f"{account.source}_allocated",
-            account_mode=account.account_mode,
-            can_trade=account.can_trade,
-            raw=account.raw,
-        )
-        warnings.append(f"Planning equity for {symbol} is capped to equal-weight sleeve capital {allocated_value:.2f}.")
-    account_position_mode = account.account_mode or cfg.trading.position_mode
-    position = build_position_snapshot(
-        positions_payload=positions_payload,
-        inst_id=symbol,
-        position_mode=account_position_mode,
-    )
-    max_buy, max_sell = extract_okx_max_size(max_size_payload)
-    plan = build_order_plan(
-        signal=signal,
-        account=planning_account,
-        position=position,
-        instrument_config=instrument_config,
-        execution_config=cfg.execution,
-        risk_config=cfg.risk,
-        trading_config=cfg.trading,
-        max_buy_contracts=max_buy,
-        max_sell_contracts=max_sell,
-    )
-    if router_decision is not None and router_decision.enabled and not router_decision.ready:
-        plan.warnings.append(
-            "Strategy router is not ready for execution: " + "; ".join(router_decision.reasons or ["route not ready"])
-        )
-    plan.warnings.extend(warnings)
-    public_factor_snapshot = _load_symbol_public_factor_snapshot(
-        cfg=cfg,
-        symbol=symbol,
-        asof=signal.latest_execution_time,
-    )
-    factor_overlay = apply_factor_overlay_to_plan(
-        symbol=symbol,
-        plan=plan,
-        lot_size=instrument_config.lot_size,
-        factor_snapshot=public_factor_snapshot,
-        min_factor_score=cfg.strategy.min_public_factor_score,
-    )
-    return account, position, {
-        "symbol": symbol,
-        "instrument_config": instrument_config,
-        "planning_account": planning_account,
-        "signal": signal,
-        "plan": plan,
-        "router_decision": router_decision.to_dict() if router_decision is not None else None,
-        "public_factor_snapshot": public_factor_snapshot,
-        "factor_overlay": factor_overlay,
-        "account_config_payload": account_config_payload,
-        "balance_payload": balance_payload,
-        "positions_payload": positions_payload,
-        "max_size_payload": max_size_payload,
-        "leverage_payload": leverage_payload,
-        "pending_orders_payload": pending_orders_payload,
-        "pending_algo_orders_payload": pending_algo_orders_payload,
-    }
 
 
 def _load_demo_portfolio_state(
@@ -689,56 +584,12 @@ def _load_demo_portfolio_state(
     session_factory=None,
     project_root: Path | None = None,
 ) -> tuple[AccountSnapshot, dict[str, dict[str, object]]]:
-    if not symbols:
-        raise typer.BadParameter("Portfolio demo requires at least one symbol.")
-
-    shared_account_payload = None
-    shared_balance_payload = None
-    private_client = None
-    if cfg.okx.api_key and cfg.okx.secret_key and cfg.okx.passphrase:
-        private_client = _build_private_client(cfg)
-        shared_account_payload = private_client.get_account_config()
-        shared_balance_payload = private_client.get_balance(ccy=cfg.instrument.settle_currency)
-
-    base_account = build_account_snapshot(
-        balance_payload=shared_balance_payload,
-        account_config_payload=shared_account_payload,
-        settle_currency=cfg.instrument.settle_currency,
-        fallback_equity=cfg.execution.initial_equity,
+    return demo_support.load_demo_portfolio_state(
+        cfg,
+        symbols,
+        session_factory=session_factory,
+        project_root=project_root,
     )
-    total_equity_reference = base_account.available_equity or base_account.total_equity or cfg.execution.initial_equity
-    sleeve_equity = total_equity_reference / len(symbols)
-    states: dict[str, dict[str, object]] = {}
-    try:
-        for symbol in symbols:
-            account, position, state = _load_demo_state_for_symbol(
-                cfg,
-                symbol,
-                session_factory=session_factory,
-                project_root=project_root,
-                private_client=private_client,
-                shared_balance_payload=shared_balance_payload,
-                shared_account_config_payload=shared_account_payload,
-                allocated_equity=sleeve_equity,
-            )
-            states[symbol] = {
-                "account": account,
-                "position": position,
-                **state,
-            }
-        portfolio_risk_controls = apply_portfolio_risk_caps(
-            symbol_states=states,
-            total_equity=total_equity_reference,
-            portfolio_max_total_risk=cfg.risk.portfolio_max_total_risk,
-            portfolio_max_same_direction_risk=cfg.risk.portfolio_max_same_direction_risk,
-        )
-        for symbol, decision in portfolio_risk_controls.items():
-            if symbol in states:
-                states[symbol]["portfolio_risk"] = decision
-    finally:
-        if private_client is not None:
-            private_client.close()
-    return base_account, states
 
 
 def _demo_state_payload(
@@ -749,26 +600,14 @@ def _demo_state_payload(
     plan: OrderPlan,
     extra: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    warnings = list(plan.warnings)
-    if account.account_mode and account.account_mode != cfg.trading.position_mode:
-        warnings.append(
-            f"OKX account posMode={account.account_mode}, while config expects {cfg.trading.position_mode}."
-        )
-    if not cfg.okx.use_demo:
-        warnings.append("okx.use_demo=false. For safety, demo-execute will refuse order submission.")
-
-    payload: dict[str, object] = {
-        "instrument": cfg.instrument.symbol,
-        "okx_use_demo": cfg.okx.use_demo,
-        "account": account.to_dict(),
-        "position": position.to_dict(),
-        "signal": signal.to_dict(),
-        "plan": plan.to_dict(),
-        "warnings": warnings,
-    }
-    if extra:
-        payload.update(extra)
-    return payload
+    return demo_support.demo_state_payload(
+        cfg=cfg,
+        account=account,
+        position=position,
+        signal=signal,
+        plan=plan,
+        extra=extra,
+    )
 
 
 def _extract_submission_refs(responses: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -833,8 +672,14 @@ def _build_client_order_id(tag: str, sequence: int) -> str:
     return f"{prefix}{timestamp}{sequence:02d}"[:32]
 
 
-def _executor_state_path(cfg) -> Path:
-    return cfg.storage.data_dir / "demo_executor_state.json"
+def _executor_state_path(cfg, *, mode: str | None = None) -> Path:
+    resolved_mode = runtime_demo_mode(config=cfg, force_mode=mode)
+    return runtime_executor_state_path(config=cfg, project_root=None, mode=resolved_mode)
+
+
+def _executor_state_info(cfg, *, mode: str | None = None) -> dict[str, Any]:
+    resolved_mode = runtime_demo_mode(config=cfg, force_mode=mode)
+    return runtime_load_executor_state_info(config=cfg, project_root=None, mode=resolved_mode)
 
 
 def _load_executor_state(path: Path) -> dict[str, object]:
@@ -847,7 +692,17 @@ def _load_executor_state(path: Path) -> dict[str, object]:
 
 
 def _save_executor_state(path: Path, payload: dict[str, object]) -> None:
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    runtime_save_executor_state(path=path, payload=payload)
+
+
+def _reset_executor_state(path: Path) -> None:
+    runtime_reset_executor_state(path=path)
+
+
+def _executor_state_gate_reason(state_info: dict[str, Any]) -> str | None:
+    if state_info.get("status") != "invalid_json":
+        return None
+    return f"Executor state is invalid JSON at {state_info.get('path')}."
 
 
 def _executor_log_path(cfg) -> Path:
@@ -916,102 +771,39 @@ def _persist_alert_results(
     title: str,
     message: str,
 ) -> list[str]:
-    results = deliver_alerts(cfg.alerts, title=title, message=message)
-    sent_channels: list[str] = []
-    with session_scope(session_factory) as session:
-        for result in results:
-            if result.delivered:
-                sent_channels.append(result.channel)
-            session.add(
-                AlertEvent(
-                    event_key=event_key,
-                    channel=result.channel,
-                    level=level,
-                    title=title,
-                    message=message if result.error is None else f"{message}\n\nerror: {result.error}",
-                    status=result.status,
-                    delivered_at=result.delivered_at,
-                )
-            )
-    return sent_channels
+    return demo_support.persist_alert_results(
+        session_factory,
+        alerts_config=cfg.alerts,
+        event_key=event_key,
+        level=level,
+        title=title,
+        message=message,
+        deliver_fn=deliver_alerts,
+    )
 
 
 def _okx_rows(payload: dict[str, object] | None) -> list[dict[str, Any]]:
-    if not isinstance(payload, dict):
-        return []
-    rows = payload.get("data")
-    if not isinstance(rows, list):
-        return []
-    return [row for row in rows if isinstance(row, dict)]
+    return demo_support.okx_rows(payload)
 
 
 def _safe_float(value: object, *, fallback: float | None = 0.0) -> float | None:
-    if value is None or value == "" or value == " ":
-        return fallback
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return fallback
+    return demo_support.safe_float(value, fallback=fallback)
 
 
 def _expected_stop_side(position_side: int) -> str | None:
-    if position_side > 0:
-        return "sell"
-    if position_side < 0:
-        return "buy"
-    return None
+    return demo_support.expected_stop_side(position_side)
 
 
 def _expected_position_leg(position_side: int, position_mode: str) -> str | None:
-    if position_mode == "long_short_mode":
-        if position_side > 0:
-            return "long"
-        if position_side < 0:
-            return "short"
-    if position_mode == "net_mode":
-        return "net"
-    return None
+    return demo_support.expected_position_leg(position_side, position_mode)
 
 
 def _matching_stop_orders(cfg, position: PositionSnapshot, pending_algo_orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if position.side == 0 or position.contracts <= 0:
-        return []
-
-    expected_side = _expected_stop_side(position.side)
-    expected_leg = _expected_position_leg(position.side, cfg.trading.position_mode)
-    size_tolerance = max(cfg.instrument.lot_size, 1e-9)
-    matches: list[dict[str, Any]] = []
-
-    for row in pending_algo_orders:
-        if row.get("instId") != cfg.instrument.symbol:
-            continue
-        state = str(row.get("state") or "").lower()
-        if state and state not in {"live", "effective", "partially_effective"}:
-            continue
-        if expected_side and row.get("side") != expected_side:
-            continue
-        row_leg = row.get("posSide")
-        if expected_leg and row_leg not in {None, "", expected_leg}:
-            continue
-        size = _safe_float(row.get("sz"), fallback=None)
-        if size is not None and abs(size - position.contracts) > size_tolerance:
-            continue
-        matches.append(row)
-
-    return matches
+    return demo_support.matching_stop_orders(cfg, position, pending_algo_orders)
 
 
 def _summarize_executor_state(executor_state: dict[str, object]) -> dict[str, object] | None:
-    if not executor_state:
-        return None
-    return {
-        "last_submitted_at": executor_state.get("last_submitted_at"),
-        "last_submitted_signature": executor_state.get("last_submitted_signature"),
-        "last_submission_refs": executor_state.get("last_submission_refs"),
-        "last_error": executor_state.get("last_error"),
-        "last_plan": executor_state.get("last_plan"),
-        "last_signal": executor_state.get("last_signal"),
-    }
+    return demo_support.summarize_executor_state(executor_state)
 
 
 def _build_demo_reconcile_payload(
@@ -1024,162 +816,15 @@ def _build_demo_reconcile_payload(
     state: dict[str, object],
     executor_state: dict[str, object],
 ) -> dict[str, object]:
-    payload = _demo_state_payload(
+    return demo_support.build_demo_reconcile_payload(
         cfg=cfg,
         account=account,
         position=position,
         signal=signal,
         plan=plan,
+        state=state,
+        executor_state=executor_state,
     )
-    warnings = list(payload["warnings"])
-    public_factor_snapshot = state.get("public_factor_snapshot")
-    if isinstance(public_factor_snapshot, PublicFactorSnapshot):
-        payload["public_factors"] = public_factor_snapshot.to_dict()
-    factor_overlay = state.get("factor_overlay")
-    if factor_overlay is not None and hasattr(factor_overlay, "to_dict"):
-        payload["factor_overlay"] = factor_overlay.to_dict()
-    router_decision = state.get("router_decision")
-    if isinstance(router_decision, dict):
-        payload["router_decision"] = router_decision
-    portfolio_risk = state.get("portfolio_risk")
-    if portfolio_risk is not None and hasattr(portfolio_risk, "to_dict"):
-        payload["portfolio_risk"] = portfolio_risk.to_dict()
-
-    leverage_rows = _okx_rows(state.get("leverage_payload"))
-    pending_orders = _okx_rows(state.get("pending_orders_payload"))
-    pending_algo_orders = _okx_rows(state.get("pending_algo_orders_payload"))
-    matching_stop_orders = _matching_stop_orders(cfg, position, pending_algo_orders)
-
-    leverage_values = [
-        value
-        for value in (_safe_float(row.get("lever"), fallback=None) for row in leverage_rows)
-        if value is not None
-    ]
-    leverage_match = None
-    if leverage_values:
-        leverage_match = all(abs(value - cfg.execution.max_leverage) <= 0.01 for value in leverage_values)
-
-    position_mode_match = None
-    if account.account_mode:
-        position_mode_match = account.account_mode == cfg.trading.position_mode
-
-    protective_stop_needed = position.side != 0 and position.contracts > 0
-    protective_stop_ready = bool(matching_stop_orders) if protective_stop_needed else True
-    size_match = None
-    if position.side != 0 and plan.target_contracts > 0:
-        size_tolerance = max(cfg.instrument.lot_size, 1e-9)
-        size_match = abs(position.contracts - plan.target_contracts) <= size_tolerance
-
-    last_submission_refs = executor_state.get("last_submission_refs")
-    tracked_algo_ids: set[str] = set()
-    if isinstance(last_submission_refs, list):
-        for ref in last_submission_refs:
-            if not isinstance(ref, dict):
-                continue
-            attach_ids = ref.get("attach_algo_cl_ord_ids")
-            if isinstance(attach_ids, list):
-                for value in attach_ids:
-                    if value:
-                        tracked_algo_ids.add(str(value))
-    tracked_live_algo_ids = sorted(
-        {
-            str(row.get("algoClOrdId"))
-            for row in pending_algo_orders
-            if row.get("algoClOrdId") and str(row.get("algoClOrdId")) in tracked_algo_ids
-        }
-    )
-
-    if account.can_trade is False:
-        warnings.append("OKX account permission does not include trade.")
-    if position_mode_match is False:
-        warnings.append(
-            f"OKX account posMode={account.account_mode}, but config expects {cfg.trading.position_mode}."
-        )
-    if leverage_match is False:
-        warnings.append(
-            f"OKX leverage setting does not match config max_leverage={cfg.execution.max_leverage:.2f}."
-        )
-    if pending_orders:
-        warnings.append(f"There are {len(pending_orders)} pending standard orders still working on OKX.")
-    if protective_stop_needed and not matching_stop_orders:
-        warnings.append("Current live position does not have a visible protective stop order on OKX.")
-    if size_match is False:
-        warnings.append(
-            f"Current live contracts {position.contracts:.4f} differ from latest target {plan.target_contracts:.4f}."
-        )
-    if executor_state.get("last_error"):
-        warnings.append("Executor state still contains the last loop error. Inspect executor_state.last_error.")
-
-    payload["checks"] = {
-        "trade_permission": account.can_trade,
-        "position_mode_match": position_mode_match,
-        "leverage_match": leverage_match,
-        "size_match": size_match,
-        "protective_stop_ready": protective_stop_ready,
-        "open_orders_idle": len(pending_orders) == 0,
-        "executor_state_present": bool(executor_state),
-        "tracked_stop_order_seen": bool(tracked_live_algo_ids) if tracked_algo_ids else None,
-    }
-    payload["exchange"] = {
-        "pending_orders": {
-            "count": len(pending_orders),
-            "items": [
-                {
-                    "ord_id": row.get("ordId"),
-                    "client_order_id": row.get("clOrdId"),
-                    "side": row.get("side"),
-                    "pos_side": row.get("posSide"),
-                    "size": row.get("sz"),
-                    "state": row.get("state"),
-                }
-                for row in pending_orders[:10]
-            ],
-        },
-        "pending_algo_orders": {
-            "count": len(pending_algo_orders),
-            "items": [
-                {
-                    "algo_id": row.get("algoId"),
-                    "algo_client_id": row.get("algoClOrdId"),
-                    "side": row.get("side"),
-                    "pos_side": row.get("posSide"),
-                    "size": row.get("sz"),
-                    "state": row.get("state"),
-                    "sl_trigger_px": row.get("slTriggerPx"),
-                }
-                for row in pending_algo_orders[:10]
-            ],
-        },
-        "leverage": {
-            "expected": cfg.execution.max_leverage,
-            "values": leverage_values,
-            "items": [
-                {
-                    "inst_id": row.get("instId"),
-                    "mgn_mode": row.get("mgnMode"),
-                    "pos_side": row.get("posSide"),
-                    "leverage": row.get("lever"),
-                }
-                for row in leverage_rows
-            ],
-        },
-        "protection_stop": {
-            "needed": protective_stop_needed,
-            "ready": protective_stop_ready,
-            "expected_side": _expected_stop_side(position.side),
-            "expected_pos_side": _expected_position_leg(position.side, cfg.trading.position_mode),
-            "matched_count": len(matching_stop_orders),
-            "matched_algo_ids": [row.get("algoId") for row in matching_stop_orders],
-        },
-    }
-    payload["executor_state"] = _summarize_executor_state(executor_state)
-    if tracked_algo_ids:
-        payload["exchange"]["executor_tracking"] = {
-            "tracked_attach_algo_client_ids": sorted(tracked_algo_ids),
-            "matched_live_algo_client_ids": tracked_live_algo_ids,
-        }
-    payload["warnings"] = warnings
-    return payload
 
 
 def _build_demo_portfolio_payload(
@@ -1190,121 +835,17 @@ def _build_demo_portfolio_payload(
     include_exchange_checks: bool,
     executor_state: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    symbols_payload: dict[str, object] = {}
-    warnings: list[str] = []
-    active_positions = 0
-    actionable_symbols = 0
-    ready_symbols = 0
-    leverage_ready_count = 0
-    stop_ready_count = 0
-    size_match_count = 0
-    public_factor_ready_count = 0
-    regime_counts = {"bull_trend": 0, "bear_trend": 0, "range": 0}
-    routed_ready_count = 0
-    for symbol, state in symbol_states.items():
-        if include_exchange_checks:
-            symbol_executor_state = {}
-            if isinstance(executor_state, dict):
-                per_symbol_state = executor_state.get("symbols")
-                if isinstance(per_symbol_state, dict):
-                    candidate = per_symbol_state.get(symbol)
-                    if isinstance(candidate, dict):
-                        symbol_executor_state = candidate
-            symbol_payload = _build_demo_reconcile_payload(
-                cfg=cfg,
-                account=state["account"],
-                position=state["position"],
-                signal=state["signal"],
-                plan=state["plan"],
-                state=state,
-                executor_state=symbol_executor_state,
-            )
-        else:
-            extra_payload = {
-                "instrument": symbol,
-                "planning_account": state["planning_account"].to_dict(),
-            }
-            public_factor_snapshot = state.get("public_factor_snapshot")
-            if isinstance(public_factor_snapshot, PublicFactorSnapshot):
-                extra_payload["public_factors"] = public_factor_snapshot.to_dict()
-            factor_overlay = state.get("factor_overlay")
-            if factor_overlay is not None and hasattr(factor_overlay, "to_dict"):
-                extra_payload["factor_overlay"] = factor_overlay.to_dict()
-            router_decision = state.get("router_decision")
-            if isinstance(router_decision, dict):
-                extra_payload["router_decision"] = router_decision
-            portfolio_risk = state.get("portfolio_risk")
-            if portfolio_risk is not None and hasattr(portfolio_risk, "to_dict"):
-                extra_payload["portfolio_risk"] = portfolio_risk.to_dict()
-            symbol_payload = _demo_state_payload(
-                cfg=cfg,
-                account=state["account"],
-                position=state["position"],
-                signal=state["signal"],
-                plan=state["plan"],
-                extra=extra_payload,
-            )
-        symbol_payload["instrument"] = symbol
-        symbol_payload["planning_account"] = state["planning_account"].to_dict()
-        symbols_payload[symbol] = symbol_payload
-        router_decision = state.get("router_decision")
-        if isinstance(router_decision, dict):
-            regime = str(router_decision.get("regime") or "").strip().lower()
-            if regime in regime_counts:
-                regime_counts[regime] += 1
-            if router_decision.get("ready") is True:
-                routed_ready_count += 1
-        warnings.extend(f"[{symbol}] {item}" for item in symbol_payload.get("warnings", []))
-        if state["position"].side != 0 and state["position"].contracts > 0:
-            active_positions += 1
-        if state["plan"].instructions:
-            actionable_symbols += 1
-        if state["signal"].ready:
-            ready_symbols += 1
-        if include_exchange_checks:
-            checks = symbol_payload.get("checks") or {}
-            if checks.get("leverage_match") is True:
-                leverage_ready_count += 1
-            if checks.get("protective_stop_ready") is True:
-                stop_ready_count += 1
-            if checks.get("size_match") is True:
-                size_match_count += 1
-        public_factors = symbol_payload.get("public_factors") or {}
-        if _safe_float(public_factors.get("confidence"), fallback=0.0) > 0:
-            public_factor_ready_count += 1
-
-    summary: dict[str, object] = {
-        "symbol_count": len(symbol_states),
-        "ready_symbol_count": ready_symbols,
-        "actionable_symbol_count": actionable_symbols,
-        "active_position_symbol_count": active_positions,
-        "allocation_mode": "equal_weight",
-        "public_factor_ready_symbol_count": public_factor_ready_count,
-        "routed_ready_symbol_count": routed_ready_count,
-        "bull_trend_symbol_count": regime_counts["bull_trend"],
-        "bear_trend_symbol_count": regime_counts["bear_trend"],
-        "range_symbol_count": regime_counts["range"],
-    }
-    if symbol_states:
-        any_state = next(iter(symbol_states.values()))
-        summary["per_symbol_planning_equity"] = round(any_state["planning_account"].available_equity, 2)
-    if include_exchange_checks:
-        summary["leverage_ready_symbol_count"] = leverage_ready_count
-        summary["protective_stop_ready_symbol_count"] = stop_ready_count
-        summary["size_match_symbol_count"] = size_match_count
-
-    return {
-        "mode": "portfolio",
-        "symbols": list(symbol_states.keys()),
-        "account": account.to_dict(),
-        "summary": summary,
-        "warnings": warnings,
-        "symbol_states": symbols_payload,
-    }
+    return demo_support.build_demo_portfolio_payload(
+        cfg=cfg,
+        account=account,
+        symbol_states=symbol_states,
+        include_exchange_checks=include_exchange_checks,
+        executor_state=executor_state,
+    )
 
 
 def _format_decimal_text(value: float) -> str:
-    return format(value, "f").rstrip("0").rstrip(".") or "0"
+    return demo_support.format_decimal_text(value)
 
 
 def _build_leverage_alignment_requests(
@@ -1313,133 +854,19 @@ def _build_leverage_alignment_requests(
     *,
     inst_id: str | None = None,
 ) -> list[dict[str, object]]:
-    target = cfg.execution.max_leverage
-    requests: list[dict[str, object]] = []
-    seen: set[tuple[tuple[str, object], ...]] = set()
-    instrument_id = inst_id or next(
-        (
-            str(row.get("instId"))
-            for row in leverage_rows
-            if row.get("instId")
-        ),
-        cfg.instrument.symbol,
-    )
-
-    pos_sides: list[str | None] = [None]
-    if cfg.trading.td_mode == "isolated" and cfg.trading.position_mode == "long_short_mode":
-        discovered = [
-            str(row.get("posSide"))
-            for row in leverage_rows
-            if row.get("posSide") not in {None, "", "net"}
-        ]
-        pos_sides = discovered or ["long", "short"]
-
-    for pos_side in pos_sides:
-        relevant_rows = leverage_rows
-        if pos_side is not None:
-            relevant_rows = [row for row in leverage_rows if str(row.get("posSide") or "") == pos_side]
-        current_values = [
-            value
-            for value in (_safe_float(row.get("lever"), fallback=None) for row in relevant_rows)
-            if value is not None
-        ]
-        if current_values and all(abs(value - target) <= 0.01 for value in current_values):
-            continue
-
-        request: dict[str, object] = {"inst_id": instrument_id, "lever": target, "mgn_mode": cfg.trading.td_mode}
-        if pos_side is not None:
-            request["pos_side"] = pos_side
-
-        signature = tuple(sorted(request.items()))
-        if signature in seen:
-            continue
-        seen.add(signature)
-        requests.append(request)
-
-    return requests
+    return demo_support.build_leverage_alignment_requests(cfg, leverage_rows, inst_id=inst_id)
 
 
 def _build_demo_align_leverage_context(cfg) -> dict[str, object]:
-    symbols = configured_symbols(cfg)
-    executor_state = _load_executor_state(_executor_state_path(cfg))
-    portfolio_mode = len(symbols) > 1
-    symbol_contexts: dict[str, dict[str, object]] = {}
-
-    if portfolio_mode:
-        account, symbol_states = _load_demo_portfolio_state(cfg, symbols)
-        before = _build_demo_portfolio_payload(
-            cfg=cfg,
-            account=account,
-            symbol_states=symbol_states,
-            include_exchange_checks=True,
-            executor_state=executor_state,
-        )
-        executor_symbols = executor_state.get("symbols") if isinstance(executor_state, dict) else {}
-        executor_symbols = executor_symbols if isinstance(executor_symbols, dict) else {}
-        for symbol, state in symbol_states.items():
-            symbol_executor_state = executor_symbols.get(symbol)
-            symbol_executor_state = symbol_executor_state if isinstance(symbol_executor_state, dict) else {}
-            leverage_rows = _okx_rows(state.get("leverage_payload"))
-            planned_requests = _build_leverage_alignment_requests(cfg, leverage_rows, inst_id=symbol)
-            blockers = _leverage_alignment_blockers(cfg, state) if planned_requests else []
-            symbol_contexts[symbol] = {
-                "account": state["account"],
-                "position": state["position"],
-                "state": state,
-                "executor_state": symbol_executor_state,
-                "leverage_rows": leverage_rows,
-                "planned_requests": planned_requests,
-                "blockers": blockers,
-            }
-    else:
-        account, position, state = _load_demo_state(cfg)
-        before = _build_demo_reconcile_payload(
-            cfg=cfg,
-            account=account,
-            position=position,
-            signal=state["signal"],
-            plan=state["plan"],
-            state=state,
-            executor_state=executor_state,
-        )
-        leverage_rows = _okx_rows(state.get("leverage_payload"))
-        planned_requests = _build_leverage_alignment_requests(
-            cfg,
-            leverage_rows,
-            inst_id=cfg.instrument.symbol,
-        )
-        symbol_contexts[cfg.instrument.symbol] = {
-            "account": account,
-            "position": position,
-            "state": state,
-            "executor_state": executor_state,
-            "leverage_rows": leverage_rows,
-            "planned_requests": planned_requests,
-            "blockers": _leverage_alignment_blockers(cfg, state) if planned_requests else [],
-        }
-
-    planned_requests: list[dict[str, object]] = []
-    blockers: list[str] = []
-    symbol_plans: dict[str, dict[str, object]] = {}
-    for symbol, context in symbol_contexts.items():
-        symbol_requests = [dict(item) for item in context["planned_requests"]]
-        symbol_blockers = [str(item) for item in context["blockers"]]
-        planned_requests.extend(symbol_requests)
-        blockers.extend([f"[{symbol}] {item}" for item in symbol_blockers])
-        symbol_plans[symbol] = {
-            "planned_requests": symbol_requests,
-            "blockers": symbol_blockers,
-        }
-
-    return {
-        "mode": "portfolio" if portfolio_mode else "single",
-        "symbols": symbols,
-        "before": before,
-        "planned_requests": planned_requests,
-        "blockers": blockers,
-        "symbol_plans": symbol_plans,
-        "_symbol_contexts": symbol_contexts,
-    }
+    return demo_support.build_demo_align_leverage_context(
+        cfg,
+        executor_state_path_fn=_executor_state_path,
+        load_executor_state_fn=_load_executor_state,
+        load_demo_state_fn=_load_demo_state,
+        load_demo_portfolio_state_fn=_load_demo_portfolio_state,
+        build_demo_reconcile_payload_fn=_build_demo_reconcile_payload,
+        build_demo_portfolio_payload_fn=_build_demo_portfolio_payload,
+    )
 
 
 def _apply_demo_align_leverage(
@@ -1448,201 +875,56 @@ def _apply_demo_align_leverage(
     symbol_contexts: dict[str, dict[str, object]],
     rearm_protective_stop: bool,
 ) -> tuple[dict[str, dict[str, object]], bool]:
-    symbol_results: dict[str, dict[str, object]] = {}
-    success = True
-
-    for symbol, context in symbol_contexts.items():
-        planned_requests = [dict(item) for item in context["planned_requests"]]
-        symbol_blockers = [str(item) for item in context["blockers"]]
-        leverage_rows = context["leverage_rows"]
-        state = context["state"]
-        position = context["position"]
-        result: dict[str, object] = {
-            "planned_requests": planned_requests,
-            "blockers": symbol_blockers,
-        }
-
-        if not planned_requests:
-            result.update({"status": "already_aligned", "applied": False, "already_aligned": True})
-            symbol_results[symbol] = result
-            continue
-
-        if symbol_blockers and not rearm_protective_stop:
-            result.update(
-                {
-                    "status": "blocked",
-                    "applied": False,
-                    "already_aligned": False,
-                    "hint": (
-                        "Re-run with --rearm-protective-stop if you want quant-lab to "
-                        "cancel and restore the stop for this symbol."
-                    ),
-                }
-            )
-            symbol_results[symbol] = result
-            success = False
-            continue
-
-        try:
-            if symbol_blockers:
-                stop_orders = _extract_rearmable_stop_orders(cfg, position, state)
-                if not stop_orders:
-                    result.update(
-                        {
-                            "status": "error",
-                            "applied": False,
-                            "already_aligned": False,
-                            "used_stop_rearm": True,
-                            "error": "Unable to locate a matching live protective stop order to re-arm.",
-                        }
-                    )
-                    symbol_results[symbol] = result
-                    success = False
-                    continue
-                alignment = _align_demo_leverage_with_stop_rearm(
-                    cfg,
-                    leverage_rows=leverage_rows,
-                    stop_orders=stop_orders,
-                )
-                result["used_stop_rearm"] = True
-            else:
-                alignment = _align_demo_leverage(cfg, leverage_rows=leverage_rows)
-                result["used_stop_rearm"] = False
-
-            result.update(
-                {
-                    "status": "aligned",
-                    "applied": True,
-                    "already_aligned": False,
-                    "alignment": alignment,
-                }
-            )
-        except OkxApiError as exc:
-            result.update(
-                {
-                    "status": "error",
-                    "applied": False,
-                    "already_aligned": False,
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
-            )
-            success = False
-
-        symbol_results[symbol] = result
-
-    return symbol_results, success
+    return demo_support.apply_demo_align_leverage(
+        cfg,
+        symbol_contexts=symbol_contexts,
+        rearm_protective_stop=rearm_protective_stop,
+        align_demo_leverage_fn=_align_demo_leverage,
+        align_demo_leverage_with_stop_rearm_fn=_align_demo_leverage_with_stop_rearm,
+        extract_rearmable_stop_orders_fn=_extract_rearmable_stop_orders,
+    )
 
 
 def _run_demo_align_leverage_action(
     cfg,
     *,
+    project_root: Path | None = None,
     apply: bool,
     confirm: str,
     rearm_protective_stop: bool,
     refresh_snapshot: Callable[[], dict[str, Any]] | None = None,
 ) -> tuple[dict[str, object], bool]:
-    context = _build_demo_align_leverage_context(cfg)
-    payload: dict[str, object] = {
-        "mode": context["mode"],
-        "symbols": context["symbols"],
-        "target_leverage": _format_decimal_text(cfg.execution.max_leverage),
-        "apply_requested": apply,
-        "planned_requests": context["planned_requests"],
-        "blockers": context["blockers"],
-        "symbol_plans": context["symbol_plans"],
-        "before": context["before"],
-    }
-
-    if not apply:
-        return payload, True
-
-    _require_private_credentials(cfg)
-    _validate_demo_account_mutation(cfg, confirm)
-    symbol_results, success = _apply_demo_align_leverage(
-        cfg,
-        symbol_contexts=context["_symbol_contexts"],
+    return runtime_run_align_leverage_action(
+        config=cfg,
+        session_factory=None,
+        project_root=(project_root or Path(".")),
+        apply=apply,
+        confirm=confirm,
         rearm_protective_stop=rearm_protective_stop,
+        refresh_snapshot=refresh_snapshot,
+        load_executor_state_fn=_load_executor_state,
+        load_demo_state_fn=_load_demo_state,
+        load_demo_portfolio_state_fn=_load_demo_portfolio_state,
+        build_demo_reconcile_payload_fn=_build_demo_reconcile_payload,
+        build_demo_portfolio_payload_fn=_build_demo_portfolio_payload,
+        require_private_credentials_fn=_require_private_credentials,
+        validate_mutation_fn=_validate_demo_account_mutation,
+        align_demo_leverage_fn=_align_demo_leverage,
+        align_demo_leverage_with_stop_rearm_fn=_align_demo_leverage_with_stop_rearm,
+        extract_rearmable_stop_orders_fn=_extract_rearmable_stop_orders,
     )
-    payload["symbol_results"] = symbol_results
-    payload["used_stop_rearm"] = any(
-        bool(result.get("used_stop_rearm"))
-        for result in symbol_results.values()
-        if isinstance(result, dict)
-    )
-    payload["applied"] = success
-    if len(symbol_results) == 1:
-        only_result = next(iter(symbol_results.values()))
-        only_result = only_result if isinstance(only_result, dict) else {}
-        for key in ("alignment", "hint", "error"):
-            if key in only_result:
-                payload[key] = only_result[key]
-
-    refreshed = refresh_snapshot() if refresh_snapshot is not None else None
-    if refreshed is None:
-        refreshed_context = _build_demo_align_leverage_context(cfg)
-        payload["after"] = refreshed_context["before"]
-    else:
-        payload["after"] = refreshed["reconcile"]
-        if "preflight" in refreshed:
-            payload["preflight"] = refreshed["preflight"]
-    return payload, success
 
 
 def _validate_demo_account_mutation(cfg, confirm: str) -> None:
-    if not cfg.okx.use_demo:
-        raise typer.BadParameter("Account mutation is blocked because okx.use_demo=false.")
-    if confirm != "OKX_DEMO":
-        raise typer.BadParameter("Refusing to mutate OKX demo account. Pass --confirm OKX_DEMO to continue.")
+    demo_support.validate_demo_account_mutation(cfg, confirm)
 
 
 def _align_demo_leverage(cfg, *, leverage_rows: list[dict[str, Any]]) -> dict[str, object]:
-    requests = _build_leverage_alignment_requests(cfg, leverage_rows)
-    if not requests:
-        return {
-            "target": cfg.execution.max_leverage,
-            "already_aligned": True,
-            "request_count": 0,
-            "requests": [],
-            "responses": [],
-        }
-
-    private_client = _build_private_client(cfg)
-    try:
-        responses: list[dict[str, object]] = []
-        for request in requests:
-            response = private_client.set_leverage(
-                lever=float(request["lever"]),
-                mgn_mode=str(request["mgn_mode"]),
-                inst_id=str(request["inst_id"]),
-                pos_side=str(request["pos_side"]) if request.get("pos_side") else None,
-            )
-            responses.append(
-                {
-                    "request": request,
-                    "response": response,
-                }
-            )
-    finally:
-        private_client.close()
-
-    return {
-        "target": cfg.execution.max_leverage,
-        "already_aligned": False,
-        "request_count": len(requests),
-        "requests": requests,
-        "responses": responses,
-    }
+    return demo_support.align_demo_leverage(cfg, leverage_rows=leverage_rows)
 
 
 def _leverage_alignment_blockers(cfg, state: dict[str, object]) -> list[str]:
-    blockers: list[str] = []
-    pending_algo_orders = _okx_rows(state.get("pending_algo_orders_payload"))
-    if cfg.trading.td_mode == "cross" and pending_algo_orders:
-        blockers.append(
-            "OKX blocks cross leverage changes while TP/SL or other algo orders are live. "
-            "Cancel and later re-arm the protective stop before retrying."
-        )
-    return blockers
+    return demo_support.leverage_alignment_blockers(cfg, state)
 
 
 def _extract_rearmable_stop_orders(
@@ -1650,31 +932,7 @@ def _extract_rearmable_stop_orders(
     position: PositionSnapshot,
     state: dict[str, object],
 ) -> list[dict[str, object]]:
-    pending_algo_orders = _okx_rows(state.get("pending_algo_orders_payload"))
-    matching_orders = _matching_stop_orders(cfg, position, pending_algo_orders)
-    stop_orders: list[dict[str, object]] = []
-    for index, row in enumerate(matching_orders, start=1):
-        trigger_px = _safe_float(row.get("slTriggerPx"), fallback=None)
-        order_px = _safe_float(row.get("slOrdPx"), fallback=-1.0)
-        size = _safe_float(row.get("sz"), fallback=None)
-        if trigger_px is None or size is None:
-            continue
-        stop_orders.append(
-            {
-                "index": index,
-                "algo_id": row.get("algoId"),
-                "algo_client_id": row.get("algoClOrdId"),
-                "inst_id": row.get("instId") or cfg.instrument.symbol,
-                "td_mode": row.get("tdMode") or cfg.trading.td_mode,
-                "side": row.get("side"),
-                "pos_side": row.get("posSide") or _expected_position_leg(position.side, cfg.trading.position_mode),
-                "size": size,
-                "sl_trigger_px": trigger_px,
-                "sl_ord_px": order_px if order_px is not None else -1.0,
-                "sl_trigger_px_type": row.get("slTriggerPxType") or cfg.trading.stop_trigger_price_type,
-            }
-        )
-    return stop_orders
+    return demo_support.extract_rearmable_stop_orders(cfg, position, state)
 
 
 def _wait_until_algo_orders_absent(private_client: OkxPrivateClient, *, inst_id: str, algo_ids: set[str]) -> bool:
@@ -1732,66 +990,11 @@ def _align_demo_leverage_with_stop_rearm(
     leverage_rows: list[dict[str, Any]],
     stop_orders: list[dict[str, object]],
 ) -> dict[str, object]:
-    requests = _build_leverage_alignment_requests(cfg, leverage_rows)
-    if not requests:
-        return {
-            "target": cfg.execution.max_leverage,
-            "already_aligned": True,
-            "request_count": 0,
-            "requests": [],
-            "cancel": None,
-            "responses": [],
-            "rearm": None,
-            "verified_stop_absence": True,
-        }
-
-    private_client = _build_private_client(cfg)
-    try:
-        cancel_payload = [
-            {
-                "algoId": str(stop["algo_id"]),
-                "instId": str(stop["inst_id"]),
-            }
-            for stop in stop_orders
-            if stop.get("algo_id")
-        ]
-        cancel_response = private_client.cancel_algo_orders(cancel_payload) if cancel_payload else None
-        verified_stop_absence = _wait_until_algo_orders_absent(
-            private_client,
-            inst_id=cfg.instrument.symbol,
-            algo_ids={str(stop["algo_id"]) for stop in stop_orders if stop.get("algo_id")},
-        )
-        responses: list[dict[str, object]] = []
-        rearm_response = None
-        try:
-            for request in requests:
-                response = private_client.set_leverage(
-                    lever=float(request["lever"]),
-                    mgn_mode=str(request["mgn_mode"]),
-                    inst_id=str(request["inst_id"]),
-                    pos_side=str(request["pos_side"]) if request.get("pos_side") else None,
-                )
-                responses.append(
-                    {
-                        "request": request,
-                        "response": response,
-                    }
-                )
-        finally:
-            rearm_response = _rearm_stop_orders(private_client, cfg, stop_orders)
-    finally:
-        private_client.close()
-
-    return {
-        "target": cfg.execution.max_leverage,
-        "already_aligned": False,
-        "request_count": len(requests),
-        "requests": requests,
-        "cancel": cancel_response,
-        "responses": responses,
-        "rearm": rearm_response,
-        "verified_stop_absence": verified_stop_absence,
-    }
+    return demo_support.align_demo_leverage_with_stop_rearm(
+        cfg,
+        leverage_rows=leverage_rows,
+        stop_orders=stop_orders,
+    )
 
 
 def _demo_submit_message(cfg, signal, plan: OrderPlan, cycle: int, responses: list[dict[str, object]]) -> str:
@@ -1851,17 +1054,7 @@ def _demo_portfolio_error_message(cfg, cycle: int, error: Exception, symbols: li
 
 
 def _portfolio_demo_status(statuses: list[str]) -> str:
-    if any(status == "submitted" for status in statuses):
-        return "submitted"
-    if any(status == "warning" for status in statuses):
-        return "warning"
-    if any(status == "duplicate" for status in statuses):
-        return "duplicate"
-    if any(status == "plan_only" for status in statuses):
-        return "plan_only"
-    if statuses and all(status == "idle" for status in statuses):
-        return "idle"
-    return statuses[0] if statuses else "ok"
+    return aggregate_execution_loop_status(statuses)
 
 
 def _portfolio_symbol_executor_state(executor_state: dict[str, object], symbol: str) -> dict[str, object]:
@@ -1885,9 +1078,18 @@ def _run_demo_loop_cycle(
     submit: bool,
     state_path: Path,
 ) -> tuple[dict[str, object], bool]:
-    executor_state = _load_executor_state(state_path)
+    LOGGER.info(
+        "demo loop cycle start mode=single cycle=%s submit=%s symbol=%s state_path=%s",
+        cycle,
+        submit,
+        cfg.instrument.symbol,
+        state_path,
+    )
+    state_info = _executor_state_info(cfg, mode="single")
+    executor_state = _load_executor_state(state_path) if state_info.get("status") == "ok" else {}
+    state_reason = _executor_state_gate_reason(state_info)
+    state_writable = state_info.get("status") != "invalid_json"
     try:
-        execution_approval = resolve_execution_approval(session_factory=session_factory, config=cfg, required_scope="demo")
         if project_root is None:
             account, position, state = _load_demo_state(cfg)
         else:
@@ -1907,19 +1109,33 @@ def _run_demo_loop_cycle(
         heartbeat_status = "ok"
         alerts_sent: list[str] = []
         router_decision = state.get("router_decision") if isinstance(state, dict) else None
+        route_decisions = {}
+        if isinstance(router_decision, dict):
+            route_decisions[cfg.instrument.symbol] = router_decision
+        execution_approval = runtime_execution_approval_payload(
+            config=cfg,
+            session_factory=session_factory,
+            project_root=(project_root or cfg.storage.data_dir.parent).resolve(),
+            route_decisions=route_decisions or None,
+        )
+        submit_gate = runtime_submit_gate_payload(
+            config=cfg,
+            session_factory=session_factory,
+            project_root=(project_root or cfg.storage.data_dir.parent).resolve(),
+            mode="single",
+            route_decisions=route_decisions or None,
+            execution_approval=execution_approval,
+            executor_state_info=state_info,
+        )
 
-        if submit and not execution_approval["ready"]:
+        if submit and not submit_gate["ready"]:
             heartbeat_status = "warning"
             loop_warnings.append(
-                "Skip submit because approved candidate gate is not satisfied: "
-                + "; ".join(execution_approval.get("reasons") or ["execution approval not ready"])
+                "Skip submit because shared runtime gate is not satisfied: "
+                + "; ".join(submit_gate.get("reasons") or ["submit gate not ready"])
             )
-        elif submit and isinstance(router_decision, dict) and router_decision.get("enabled") and not router_decision.get("ready"):
-            heartbeat_status = "warning"
-            loop_warnings.append(
-                "Skip submit because strategy router did not resolve an executable approved candidate: "
-                + "; ".join(router_decision.get("reasons") or ["router decision not ready"])
-            )
+        elif state_reason:
+            loop_warnings.append(state_reason)
         elif submit and plan.instructions and not already_submitted:
             if account.account_mode and account.account_mode != cfg.trading.position_mode:
                 heartbeat_status = "warning"
@@ -1967,39 +1183,40 @@ def _run_demo_loop_cycle(
             "responses": responses,
             "loop_warnings": loop_warnings,
             "executor_state_path": str(state_path),
+            "executor_state_status": state_info.get("status"),
             "alerts_sent": alerts_sent,
             "router_decision": state.get("router_decision"),
         }
-        _save_executor_state(state_path, executor_state)
+        if state_writable:
+            _save_executor_state(state_path, executor_state)
         _persist_heartbeat(
             session_factory,
-            service_name="quant-lab-demo-loop",
+            service_name=runtime_heartbeat_service_name(mode="single"),
             status=heartbeat_status,
-            details={
-                "cycle": cycle,
-                "symbol": cfg.instrument.symbol,
-                "strategy_name": state.get("router_decision", {}).get("selected_strategy_name", cfg.strategy.name),
-                "strategy_variant": state.get("router_decision", {}).get("selected_variant", cfg.strategy.variant),
-                "action": plan.action,
-                "reason": plan.reason,
-                "desired_side": signal.desired_side,
-                "current_side": position.side,
-                "current_contracts": position.contracts,
-                "target_contracts": plan.target_contracts,
-                "submitted": submitted,
-                "response_count": len(responses),
-                "warning_count": len(loop_warnings),
-                "warnings": loop_warnings,
-                "already_submitted": already_submitted,
-                "latest_price": signal.latest_price,
-                "total_equity": account.total_equity,
-                "available_equity": account.available_equity,
-                "execution_approval": execution_approval,
-                "router_decision": state.get("router_decision"),
-                "signal_time": signal.signal_time.isoformat(),
-                "effective_time": signal.effective_time.isoformat(),
-                "executor_state_path": str(state_path),
-            },
+            details=runtime_build_single_demo_heartbeat_details(
+                cycle=cycle,
+                symbol=cfg.instrument.symbol,
+                status=heartbeat_status,
+                account=account,
+                position=position,
+                signal=signal,
+                plan=plan,
+                submitted=submitted,
+                responses=responses,
+                warnings=loop_warnings,
+                already_submitted=already_submitted,
+                execution_approval=execution_approval,
+                route_decision=state.get("router_decision"),
+                executor_state_path=str(state_path),
+                executor_state_status=state_info.get("status"),
+            ),
+        )
+        LOGGER.info(
+            "demo loop cycle completed mode=single cycle=%s status=%s submitted=%s warnings=%s",
+            cycle,
+            heartbeat_status,
+            submitted,
+            len(loop_warnings),
         )
         return (
             {
@@ -2033,17 +1250,25 @@ def _run_demo_loop_cycle(
             "message": f"{type(exc).__name__}: {exc}",
             "timestamp": pd.Timestamp.now(tz="UTC").isoformat(),
         }
-        _save_executor_state(state_path, executor_state)
+        if state_writable:
+            _save_executor_state(state_path, executor_state)
         _persist_heartbeat(
             session_factory,
-            service_name="quant-lab-demo-loop",
+            service_name=runtime_heartbeat_service_name(mode="single"),
             status="error",
-            details={
-                "cycle": cycle,
-                "symbol": cfg.instrument.symbol,
-                "strategy_name": cfg.strategy.name,
-                "error": f"{type(exc).__name__}: {exc}",
-            },
+            details=runtime_build_single_demo_heartbeat_details(
+                cycle=cycle,
+                symbol=cfg.instrument.symbol,
+                status="error",
+                executor_state_path=str(state_path),
+                executor_state_status=state_info.get("status"),
+                error=f"{type(exc).__name__}: {exc}",
+            ),
+        )
+        LOGGER.exception(
+            "demo loop cycle failed mode=single cycle=%s symbol=%s",
+            cycle,
+            cfg.instrument.symbol,
         )
         return (
             {
@@ -2068,9 +1293,18 @@ def _run_demo_portfolio_loop_cycle(
     state_path: Path,
     symbols: list[str],
 ) -> tuple[dict[str, object], bool]:
-    executor_state = _load_executor_state(state_path)
+    LOGGER.info(
+        "demo loop cycle start mode=portfolio cycle=%s submit=%s symbols=%s state_path=%s",
+        cycle,
+        submit,
+        ",".join(symbols),
+        state_path,
+    )
+    state_info = _executor_state_info(cfg, mode="portfolio")
+    executor_state = _load_executor_state(state_path) if state_info.get("status") == "ok" else {}
+    state_reason = _executor_state_gate_reason(state_info)
+    state_writable = state_info.get("status") != "invalid_json"
     try:
-        execution_approval = resolve_execution_approval(session_factory=session_factory, config=cfg, required_scope="demo")
         if project_root is None:
             account, symbol_states = _load_demo_portfolio_state(cfg, symbols)
         else:
@@ -2080,11 +1314,37 @@ def _run_demo_portfolio_loop_cycle(
                 session_factory=session_factory,
                 project_root=project_root,
             )
+        route_decisions = {
+            symbol: state.get("router_decision")
+            for symbol, state in symbol_states.items()
+            if isinstance(state.get("router_decision"), dict)
+        }
+        execution_approval = runtime_execution_approval_payload(
+            config=cfg,
+            session_factory=session_factory,
+            project_root=(project_root or cfg.storage.data_dir.parent).resolve(),
+            route_decisions=route_decisions or None,
+        )
+        submit_gate = runtime_submit_gate_payload(
+            config=cfg,
+            session_factory=session_factory,
+            project_root=(project_root or cfg.storage.data_dir.parent).resolve(),
+            mode="portfolio",
+            route_decisions=route_decisions or None,
+            execution_approval=execution_approval,
+            executor_state_info=state_info,
+        )
         symbol_payloads: dict[str, dict[str, object]] = {}
         statuses: list[str] = []
         submitted_symbols: list[str] = []
         total_responses = 0
         total_warnings = 0
+        submit_gate_warning = (
+            "Skip submit because shared runtime gate is not satisfied: "
+            + "; ".join(submit_gate.get("reasons") or ["submit gate not ready"])
+            if submit and not submit_gate["ready"]
+            else None
+        )
 
         for symbol, state in symbol_states.items():
             plan: OrderPlan = state["plan"]
@@ -2098,20 +1358,13 @@ def _run_demo_portfolio_loop_cycle(
             responses: list[dict[str, object]] = []
             loop_warnings: list[str] = []
             status = "ok"
-            router_decision = state.get("router_decision") if isinstance(state, dict) else None
 
-            if submit and not execution_approval["ready"]:
+            if submit_gate_warning:
                 status = "warning"
-                loop_warnings.append(
-                    "Skip submit because approved candidate gate is not satisfied: "
-                    + "; ".join(execution_approval.get("reasons") or ["execution approval not ready"])
-                )
-            elif submit and isinstance(router_decision, dict) and router_decision.get("enabled") and not router_decision.get("ready"):
-                status = "warning"
-                loop_warnings.append(
-                    "Skip submit because strategy router did not resolve an executable approved candidate: "
-                    + "; ".join(router_decision.get("reasons") or ["router decision not ready"])
-                )
+                loop_warnings.append(submit_gate_warning)
+            elif state_reason:
+                status = "warning" if submit else status
+                loop_warnings.append(state_reason)
             elif submit and plan.instructions and not already_submitted:
                 if account.account_mode and account.account_mode != cfg.trading.position_mode:
                     status = "warning"
@@ -2199,30 +1452,6 @@ def _run_demo_portfolio_loop_cycle(
             )
 
         portfolio_status = _portfolio_demo_status(statuses)
-        actionable_symbol_count = sum(
-            1 for state in symbol_states.values() if state["plan"].instructions
-        )
-        active_position_symbol_count = sum(
-            1 for state in symbol_states.values() if state["position"].side != 0 and state["position"].contracts > 0
-        )
-        heartbeat_details = {
-            "cycle": cycle,
-            "mode": "portfolio",
-            "symbols": symbols,
-            "symbol_count": len(symbols),
-            "submitted_symbol_count": len(submitted_symbols),
-            "submitted_symbols": submitted_symbols,
-            "actionable_symbol_count": actionable_symbol_count,
-            "active_position_symbol_count": active_position_symbol_count,
-            "response_count": total_responses,
-            "warning_count": total_warnings,
-            "total_equity": account.total_equity,
-            "available_equity": account.available_equity,
-            "execution_approval": execution_approval,
-            "strategy_router_enabled": bool(cfg.trading.strategy_router_enabled),
-            "symbol_states": symbol_payloads,
-            "executor_state_path": str(state_path),
-        }
         executor_state["portfolio"] = {
             "last_cycle": cycle,
             "symbols": symbols,
@@ -2230,12 +1459,32 @@ def _run_demo_portfolio_loop_cycle(
             "submitted_symbols": submitted_symbols,
             "last_error": executor_state.get("last_error"),
         }
-        _save_executor_state(state_path, executor_state)
+        if state_writable:
+            _save_executor_state(state_path, executor_state)
         _persist_heartbeat(
             session_factory,
-            service_name="quant-lab-demo-loop",
+            service_name=runtime_heartbeat_service_name(mode="portfolio"),
             status=portfolio_status,
-            details=heartbeat_details,
+            details=runtime_build_portfolio_demo_heartbeat_details(
+                cycle=cycle,
+                status=portfolio_status,
+                symbols=symbols,
+                account=account,
+                symbol_states=symbol_states,
+                symbol_payloads=symbol_payloads,
+                submitted_symbols=submitted_symbols,
+                execution_approval=execution_approval,
+                strategy_router_enabled=bool(cfg.trading.strategy_router_enabled),
+                executor_state_path=str(state_path),
+                executor_state_status=state_info.get("status"),
+            ),
+        )
+        LOGGER.info(
+            "demo loop cycle completed mode=portfolio cycle=%s status=%s submitted_symbols=%s warnings=%s",
+            cycle,
+            portfolio_status,
+            len(submitted_symbols),
+            total_warnings,
         )
         return (
             {
@@ -2278,18 +1527,26 @@ def _run_demo_portfolio_loop_cycle(
             "timestamp": pd.Timestamp.now(tz="UTC").isoformat(),
             "symbols": symbols,
         }
-        _save_executor_state(state_path, executor_state)
+        if state_writable:
+            _save_executor_state(state_path, executor_state)
         _persist_heartbeat(
             session_factory,
-            service_name="quant-lab-demo-loop",
+            service_name=runtime_heartbeat_service_name(mode="portfolio"),
             status="error",
-            details={
-                "cycle": cycle,
-                "mode": "portfolio",
-                "symbols": symbols,
-                "strategy_name": cfg.strategy.name,
-                "error": f"{type(exc).__name__}: {exc}",
-            },
+            details=runtime_build_portfolio_demo_heartbeat_details(
+                cycle=cycle,
+                status="error",
+                symbols=symbols,
+                submitted_symbols=[],
+                executor_state_path=str(state_path),
+                executor_state_status=state_info.get("status"),
+                error=f"{type(exc).__name__}: {exc}",
+            ),
+        )
+        LOGGER.exception(
+            "demo loop cycle failed mode=portfolio cycle=%s symbols=%s",
+            cycle,
+            ",".join(symbols),
         )
         return (
             {
@@ -2306,20 +1563,33 @@ def _run_demo_portfolio_loop_cycle(
         )
 
 
-def _validate_submit_permissions(cfg, session_factory, confirm: str) -> None:
-    if not cfg.okx.use_demo:
-        raise typer.BadParameter("Order submission is blocked because okx.use_demo=false.")
-    if not cfg.trading.allow_order_placement:
-        raise typer.BadParameter(
-            "Order submission is disabled. Set trading.allow_order_placement=true or QUANT_LAB_ALLOW_ORDER_PLACEMENT=true."
-        )
-    execution_approval = resolve_execution_approval(session_factory=session_factory, config=cfg, required_scope="demo")
-    if not execution_approval["ready"]:
-        reasons = "; ".join(execution_approval.get("reasons") or ["execution approval not ready"])
-        raise typer.BadParameter(
-            "Order submission is blocked by the approved-candidate gate. "
-            f"Reasons: {reasons}"
-        )
+def _validate_submit_permissions(
+    cfg,
+    session_factory,
+    confirm: str,
+    *,
+    project_root: Path | None = None,
+    mode: str | None = None,
+    route_decisions: dict[str, dict[str, Any]] | None = None,
+) -> None:
+    effective_root = project_root or cfg.storage.data_dir.parent
+    execution_approval = runtime_execution_approval_payload(
+        config=cfg,
+        session_factory=session_factory,
+        project_root=effective_root.resolve(),
+        route_decisions=route_decisions,
+    )
+    submit_gate = runtime_submit_gate_payload(
+        config=cfg,
+        session_factory=session_factory,
+        project_root=effective_root.resolve(),
+        mode=mode,
+        route_decisions=route_decisions,
+        execution_approval=execution_approval,
+    )
+    if not submit_gate["ready"]:
+        reasons = "; ".join(submit_gate.get("reasons") or ["submit gate not ready"])
+        raise typer.BadParameter(f"Order submission is blocked by the shared runtime gate. Reasons: {reasons}")
     if confirm != "OKX_DEMO":
         raise typer.BadParameter("Refusing to submit orders. Pass --confirm OKX_DEMO to continue.")
 
@@ -2385,11 +1655,11 @@ def download(
     resolved_symbols = _resolve_symbols(cfg, symbols)
 
     typer.echo(
-        f"Downloading OKX data for {_symbol_list_label(resolved_symbols)} "
+        f"Downloading {market_data_provider_name(cfg).upper()} data for {_symbol_list_label(resolved_symbols)} "
         f"from {start_ts.date()} to {end_ts.date()}..."
     )
 
-    client = OkxPublicClient(base_url=cfg.okx.rest_base_url, proxy_url=cfg.okx.proxy_url)
+    client = build_market_data_provider(cfg)
     try:
         for symbol in resolved_symbols:
             symbol_slug = _symbol_slug(symbol)
@@ -2461,11 +1731,11 @@ def download_public_factors(
     resolved_symbols = _resolve_symbols(cfg, symbols)
 
     typer.echo(
-        f"Downloading OKX public factor data for {_symbol_list_label(resolved_symbols)} "
+        f"Downloading {market_data_provider_name(cfg).upper()} public factor data for {_symbol_list_label(resolved_symbols)} "
         f"from {start_ts.date()} to {end_ts.date()}..."
     )
 
-    client = OkxPublicClient(base_url=cfg.okx.rest_base_url, proxy_url=cfg.okx.proxy_url)
+    client = build_market_data_provider(cfg)
     try:
         for symbol in resolved_symbols:
             symbol_slug = _symbol_slug(symbol)
@@ -2610,15 +1880,23 @@ def backtest(
         )
 
         report_prefix = f"{symbol_slug}_{cfg.strategy.name}"
+        artifact_identity = backtest_artifact_identity(
+            config=cfg,
+            project_root=project_root.resolve(),
+            symbols=resolved_symbols,
+        )
         trades_path, equity_path, summary_path = _write_backtest_artifacts(
             storage=storage,
             report_prefix=report_prefix,
             trades_frame=_trades_frame(artifacts.trades),
             equity_curve=artifacts.equity_curve,
             summary=summary,
+            signal_frame=artifacts.signal_frame,
+            execution_bars=execution_bars,
+            artifact_identity=artifact_identity,
         )
 
-        typer.echo("Backtest complete.")
+        typer.echo("回测完成。")
         typer.echo(json.dumps(summary, ensure_ascii=False, indent=2))
         typer.echo(f"Trades: {trades_path}")
         typer.echo(f"Equity curve: {equity_path}")
@@ -2631,6 +1909,7 @@ def backtest(
     storage = cfg.storage
     per_symbol_initial_equity = cfg.execution.initial_equity / len(resolved_symbols)
     equity_curves_by_symbol: dict[str, pd.DataFrame] = {}
+    artifacts_by_symbol: dict[str, BacktestArtifacts] = {}
     trades_by_symbol: dict[str, list[TradeRecord]] = {}
     all_trades: list[TradeRecord] = []
     sleeve_summaries: list[dict[str, object]] = []
@@ -2669,18 +1948,28 @@ def backtest(
         sleeve_summaries.append(summary)
 
         report_prefix = f"{symbol_slug}_{cfg.strategy.name}_sleeve"
+        artifact_identity = backtest_sleeve_artifact_identity(
+            config=cfg,
+            project_root=project_root.resolve(),
+            portfolio_symbols=resolved_symbols,
+            symbol=symbol,
+        )
         trades_path, equity_path, summary_path = _write_backtest_artifacts(
             storage=storage,
             report_prefix=report_prefix,
             trades_frame=_trades_frame(artifacts.trades),
             equity_curve=artifacts.equity_curve,
             summary=summary,
+            signal_frame=artifacts.signal_frame,
+            execution_bars=execution_bars,
+            artifact_identity=artifact_identity,
         )
         typer.echo(f"[{symbol}] trades: {trades_path}")
         typer.echo(f"[{symbol}] equity: {equity_path}")
         typer.echo(f"[{symbol}] summary: {summary_path}")
 
         equity_curves_by_symbol[symbol] = artifacts.equity_curve
+        artifacts_by_symbol[symbol] = artifacts
         trades_by_symbol[symbol] = artifacts.trades
         all_trades.extend(artifacts.trades)
 
@@ -2692,16 +1981,34 @@ def backtest(
         initial_equity=cfg.execution.initial_equity,
         symbols=resolved_symbols,
     )
-    portfolio_summary["allocation_mode"] = "equal_weight"
-    portfolio_summary["per_symbol_initial_equity"] = round(per_symbol_initial_equity, 2)
+    portfolio_summary = attach_equal_weight_portfolio_construction(
+        portfolio_summary,
+        per_symbol_initial_equity=per_symbol_initial_equity,
+    )
+    portfolio_allocation_overlay = build_portfolio_risk_budget_overlay(
+        symbol_artifacts=artifacts_by_symbol,
+        execution_config=cfg.execution,
+        risk_config=cfg.risk,
+    )
+    portfolio_summary = attach_portfolio_risk_budget_overlay(
+        portfolio_summary,
+        allocation_frame=portfolio_allocation_overlay,
+    )
 
     portfolio_prefix = _portfolio_report_prefix(resolved_symbols, cfg.strategy.name)
+    portfolio_identity = backtest_artifact_identity(
+        config=cfg,
+        project_root=project_root.resolve(),
+        symbols=resolved_symbols,
+    )
     trades_path, equity_path, summary_path = _write_backtest_artifacts(
         storage=storage,
         report_prefix=portfolio_prefix,
         trades_frame=portfolio_trades,
         equity_curve=portfolio_equity,
         summary=portfolio_summary,
+        allocation_overlay=portfolio_allocation_overlay,
+        artifact_identity=portfolio_identity,
     )
     sleeves_path = storage.report_dir / f"{portfolio_prefix}_sleeves.csv"
     pd.DataFrame(sleeve_summaries).to_csv(sleeves_path, index=False)
@@ -2720,7 +2027,7 @@ def sync_instrument(
     dry_run: bool = typer.Option(False, help="Show the exchange metadata without writing the config."),
 ) -> None:
     cfg = load_config(config)
-    client = OkxPublicClient(base_url=cfg.okx.rest_base_url)
+    client = build_market_data_provider(cfg)
     try:
         instrument = client.fetch_instrument_details(
             inst_type=cfg.instrument.instrument_type,
@@ -2753,9 +2060,9 @@ def sync_instrument(
 def sweep(
     config: Path = typer.Option(..., exists=True, dir_okay=False, help="Path to the YAML config file."),
     project_root: Path = typer.Option(Path("."), file_okay=False, help="Project root for storage paths."),
-    fast: str = typer.Option("10,20,30", help="Comma-separated fast EMA values."),
-    slow: str = typer.Option("50,80,120", help="Comma-separated slow EMA values."),
-    atr: str = typer.Option("1.5,2.0,2.5", help="Comma-separated ATR stop multiples."),
+    fast: str = typer.Option(DEFAULT_PROJECT_SWEEP_FAST, help="Comma-separated fast EMA values."),
+    slow: str = typer.Option(DEFAULT_PROJECT_SWEEP_SLOW, help="Comma-separated slow EMA values."),
+    atr: str = typer.Option(DEFAULT_PROJECT_SWEEP_ATR, help="Comma-separated ATR stop multiples."),
 ) -> None:
     cfg, storage, signal_bars, execution_bars, funding, symbol_slug = _load_report_inputs(
         config=config,
@@ -2790,14 +2097,42 @@ def sweep(
     if results.empty:
         raise typer.BadParameter("No valid parameter combinations were produced. Check the EMA ranges.")
 
-    report_prefix = f"{symbol_slug}_{cfg.strategy.name}"
-    results_path = storage.report_dir / f"{report_prefix}_sweep.csv"
-    dashboard_path = storage.report_dir / f"{report_prefix}_sweep_dashboard.html"
+    artifact_identity = sweep_artifact_identity(
+        config=cfg,
+        project_root=project_root.resolve(),
+        extra={
+            "fast_values": fast_values,
+            "slow_values": slow_values,
+            "atr_values": atr_values,
+        },
+    )
+    report_prefix = str(artifact_identity["logical_prefix"])
+    artifact_paths = canonical_artifact_paths(
+        report_dir=storage.report_dir,
+        identity=artifact_identity,
+        suffixes={
+            "sweep_csv": "sweep.csv",
+            "dashboard": "sweep_dashboard.html",
+        },
+    )
+    results_path = artifact_paths["sweep_csv"]
+    dashboard_path = artifact_paths["dashboard"]
     results.to_csv(results_path, index=False)
     render_sweep_dashboard(
         results=results,
         output_path=dashboard_path,
         title=f"{cfg.instrument.symbol} {cfg.strategy.name}",
+    )
+    register_artifact_group(
+        report_dir=storage.report_dir,
+        identity=artifact_identity,
+        artifacts=artifact_paths,
+        legacy_artifact_sets=[
+            {
+                "sweep_csv": storage.report_dir / f"{report_prefix}_sweep.csv",
+                "dashboard": storage.report_dir / f"{report_prefix}_sweep_dashboard.html",
+            }
+        ],
     )
 
     typer.echo(f"Sweep results: {results_path}")
@@ -2823,14 +2158,14 @@ def research_trend(
     config: Path = typer.Option(..., exists=True, dir_okay=False, help="Path to the YAML config file."),
     project_root: Path = typer.Option(Path("."), file_okay=False, help="Project root for storage paths."),
     variants: str = typer.Option(
-        "breakout_retest,breakout_retest_regime,breakout_retest_adx,breakout_retest_regime_adx",
+        DEFAULT_PROJECT_RESEARCH_VARIANTS,
         help="Comma-separated strategy variants.",
     ),
-    fast: str = typer.Option("8,12,16", help="Comma-separated fast EMA or pullback EMA values."),
-    slow: str = typer.Option("24,36,48,72", help="Comma-separated slow EMA or breakout window values."),
-    atr: str = typer.Option("2.5,3.0,3.5", help="Comma-separated ATR stop multiples."),
-    trend_ema: str = typer.Option("200", help="Comma-separated long-term EMA values for regime filters."),
-    adx: str = typer.Option("20,25", help="Comma-separated ADX thresholds for trend filters."),
+    fast: str = typer.Option(DEFAULT_PROJECT_RESEARCH_FAST, help="Comma-separated fast EMA or pullback EMA values."),
+    slow: str = typer.Option(DEFAULT_PROJECT_RESEARCH_SLOW, help="Comma-separated slow EMA or breakout window values."),
+    atr: str = typer.Option(DEFAULT_PROJECT_RESEARCH_ATR, help="Comma-separated ATR stop multiples."),
+    trend_ema: str = typer.Option(DEFAULT_PROJECT_RESEARCH_TREND_EMA, help="Comma-separated long-term EMA values for regime filters."),
+    adx: str = typer.Option(DEFAULT_PROJECT_RESEARCH_ADX, help="Comma-separated ADX thresholds for trend filters."),
     output_prefix: str | None = typer.Option(None, help="Optional custom report prefix."),
 ) -> None:
     cfg, storage, signal_bars, execution_bars, funding, symbol_slug = _load_report_inputs(
@@ -2874,15 +2209,47 @@ def research_trend(
     if results.empty:
         raise typer.BadParameter("No valid research combinations were produced.")
 
-    report_prefix = output_prefix or f"{symbol_slug}_{cfg.strategy.name}_trend_research"
-    results_path = storage.report_dir / f"{report_prefix}.csv"
-    dashboard_path = storage.report_dir / f"{report_prefix}.html"
+    report_prefix = output_prefix or default_project_research_report_prefix(cfg)
+    artifact_identity = trend_research_artifact_identity(
+        config=cfg,
+        project_root=project_root.resolve(),
+        logical_prefix=report_prefix,
+        extra={
+            "variant_values": variant_values,
+            "fast_values": fast_values,
+            "slow_values": slow_values,
+            "atr_values": atr_values,
+            "trend_ema_values": trend_ema_values,
+            "adx_values": adx_values,
+        },
+    )
+    artifact_paths = canonical_artifact_paths(
+        report_dir=storage.report_dir,
+        identity=artifact_identity,
+        suffixes={
+            "research_csv": "research.csv",
+            "dashboard": "dashboard.html",
+        },
+    )
+    results_path = artifact_paths["research_csv"]
+    dashboard_path = artifact_paths["dashboard"]
 
     results.to_csv(results_path, index=False)
     render_trend_research_dashboard(
         results=results,
         output_path=dashboard_path,
-        title=f"{cfg.instrument.symbol} {cfg.strategy.name} {cfg.strategy.signal_bar} Trend Research",
+            title=f"{cfg.instrument.symbol} {cfg.strategy.name} {cfg.strategy.signal_bar} 趋势研究",
+    )
+    register_artifact_group(
+        report_dir=storage.report_dir,
+        identity=artifact_identity,
+        artifacts=artifact_paths,
+        legacy_artifact_sets=[
+            {
+                "research_csv": storage.report_dir / f"{report_prefix}.csv",
+                "dashboard": storage.report_dir / f"{report_prefix}.html",
+            }
+        ],
     )
 
     typer.echo(f"Research results: {results_path}")
@@ -2920,14 +2287,32 @@ def report(
     cfg = _load_app_context(config=config, project_root=project_root)
     storage = cfg.storage
     resolved_symbols = _resolve_symbols(cfg, symbols)
+    resolved_root = project_root.resolve()
 
     if len(resolved_symbols) == 1:
-        symbol_slug = _symbol_slug(resolved_symbols[0])
-        report_prefix = f"{symbol_slug}_{cfg.strategy.name}"
-        trades_path = storage.report_dir / f"{report_prefix}_trades.csv"
-        equity_path = storage.report_dir / f"{report_prefix}_equity_curve.csv"
-        summary_path = storage.report_dir / f"{report_prefix}_summary.json"
-        output_path = output or (storage.report_dir / f"{report_prefix}_dashboard.html")
+        artifact_identity, resolution = _backtest_artifact_resolution(cfg, resolved_root, resolved_symbols)
+        report_prefix = str(artifact_identity["logical_prefix"])
+        trades_path = _artifact_resolution_path(
+            resolution,
+            "trades",
+            storage.report_dir / f"{report_prefix}_trades.csv",
+        )
+        equity_path = _artifact_resolution_path(
+            resolution,
+            "equity_curve",
+            storage.report_dir / f"{report_prefix}_equity_curve.csv",
+        )
+        summary_path = _artifact_resolution_path(
+            resolution,
+            "summary",
+            storage.report_dir / f"{report_prefix}_summary.json",
+        )
+        default_output_path = report_runtime.backtest_artifact_paths(
+            storage=storage,
+            artifact_identity=artifact_identity,
+            include_dashboard=True,
+        )["dashboard"]
+        output_path = output or default_output_path
 
         for path in (summary_path, equity_path, trades_path):
             if not path.exists():
@@ -2940,17 +2325,51 @@ def report(
             output_path=output_path,
             title=f"{resolved_symbols[0]} {cfg.strategy.name}",
         )
+        if output is None:
+            register_artifact_group(
+                report_dir=storage.report_dir,
+                identity=artifact_identity,
+                artifacts={"dashboard": output_path},
+                legacy_artifact_sets=[
+                    report_runtime.backtest_legacy_artifact_paths(
+                        storage=storage,
+                        report_prefix=report_prefix,
+                        include_dashboard=True,
+                    )
+                ],
+            )
         typer.echo(f"Dashboard: {output_path}")
         return
 
     dashboard_paths: list[Path] = []
     for symbol in resolved_symbols:
-        symbol_slug = _symbol_slug(symbol)
-        report_prefix = f"{symbol_slug}_{cfg.strategy.name}_sleeve"
-        trades_path = storage.report_dir / f"{report_prefix}_trades.csv"
-        equity_path = storage.report_dir / f"{report_prefix}_equity_curve.csv"
-        summary_path = storage.report_dir / f"{report_prefix}_summary.json"
-        output_path = storage.report_dir / f"{report_prefix}_dashboard.html"
+        artifact_identity, resolution = _sleeve_backtest_artifact_resolution(
+            cfg,
+            resolved_root,
+            resolved_symbols,
+            symbol,
+        )
+        report_prefix = str(artifact_identity["logical_prefix"])
+        trades_path = _artifact_resolution_path(
+            resolution,
+            "trades",
+            storage.report_dir / f"{report_prefix}_trades.csv",
+        )
+        equity_path = _artifact_resolution_path(
+            resolution,
+            "equity_curve",
+            storage.report_dir / f"{report_prefix}_equity_curve.csv",
+        )
+        summary_path = _artifact_resolution_path(
+            resolution,
+            "summary",
+            storage.report_dir / f"{report_prefix}_summary.json",
+        )
+        output_path = report_runtime.backtest_artifact_paths(
+            storage=storage,
+            artifact_identity=artifact_identity,
+            include_dashboard=True,
+        )["dashboard"]
 
         for path in (summary_path, equity_path, trades_path):
             if not path.exists():
@@ -2961,16 +2380,46 @@ def report(
             equity_curve_path=equity_path,
             trades_path=trades_path,
             output_path=output_path,
-            title=f"{symbol} {cfg.strategy.name} Sleeve",
+            title=f"{symbol} {cfg.strategy.name} 子报表",
+        )
+        register_artifact_group(
+            report_dir=storage.report_dir,
+            identity=artifact_identity,
+            artifacts={"dashboard": output_path},
+            legacy_artifact_sets=[
+                report_runtime.backtest_legacy_artifact_paths(
+                    storage=storage,
+                    report_prefix=report_prefix,
+                    include_dashboard=True,
+                )
+            ],
         )
         dashboard_paths.append(output_path)
         typer.echo(f"[{symbol}] dashboard: {output_path}")
 
-    portfolio_prefix = _portfolio_report_prefix(resolved_symbols, cfg.strategy.name)
-    trades_path = storage.report_dir / f"{portfolio_prefix}_trades.csv"
-    equity_path = storage.report_dir / f"{portfolio_prefix}_equity_curve.csv"
-    summary_path = storage.report_dir / f"{portfolio_prefix}_summary.json"
-    output_path = output or (storage.report_dir / f"{portfolio_prefix}_dashboard.html")
+    artifact_identity, resolution = _backtest_artifact_resolution(cfg, resolved_root, resolved_symbols)
+    portfolio_prefix = str(artifact_identity["logical_prefix"])
+    trades_path = _artifact_resolution_path(
+        resolution,
+        "trades",
+        storage.report_dir / f"{portfolio_prefix}_trades.csv",
+    )
+    equity_path = _artifact_resolution_path(
+        resolution,
+        "equity_curve",
+        storage.report_dir / f"{portfolio_prefix}_equity_curve.csv",
+    )
+    summary_path = _artifact_resolution_path(
+        resolution,
+        "summary",
+        storage.report_dir / f"{portfolio_prefix}_summary.json",
+    )
+    default_output_path = report_runtime.backtest_artifact_paths(
+        storage=storage,
+        artifact_identity=artifact_identity,
+        include_dashboard=True,
+    )["dashboard"]
+    output_path = output or default_output_path
 
     for path in (summary_path, equity_path, trades_path):
         if not path.exists():
@@ -2981,8 +2430,21 @@ def report(
         equity_curve_path=equity_path,
         trades_path=trades_path,
         output_path=output_path,
-        title=f"Portfolio {_symbol_list_label(resolved_symbols)} {cfg.strategy.name}",
+        title=f"组合 {_symbol_list_label(resolved_symbols)} {cfg.strategy.name}",
     )
+    if output is None:
+        register_artifact_group(
+            report_dir=storage.report_dir,
+            identity=artifact_identity,
+            artifacts={"dashboard": output_path},
+            legacy_artifact_sets=[
+                report_runtime.backtest_legacy_artifact_paths(
+                    storage=storage,
+                    report_prefix=portfolio_prefix,
+                    include_dashboard=True,
+                )
+            ],
+        )
     dashboard_paths.append(output_path)
 
     typer.echo("Rendered dashboards:")
@@ -3004,18 +2466,21 @@ def research_create_task(
     ),
     notes: str = typer.Option("", help="Free-form research notes."),
 ) -> None:
-    cfg, session_factory = _load_runtime_context(config=config, project_root=project_root)
-    init_db(cfg.database.url)
-    task = create_research_task(
-        session_factory=session_factory,
-        title=title,
-        hypothesis=hypothesis,
-        owner_role=owner_role,
-        priority=priority,
-        symbols=_resolve_symbols(cfg, symbols),
-        notes=notes,
-    )
-    typer.echo(json.dumps(serialize_research_task(task), ensure_ascii=False, indent=2))
+    def _execute() -> None:
+        cfg, session_factory = _load_runtime_context(config=config, project_root=project_root)
+        init_db(cfg.database.url)
+        task = create_research_task(
+            session_factory=session_factory,
+            title=title,
+            hypothesis=hypothesis,
+            owner_role=owner_role,
+            priority=priority,
+            symbols=_resolve_symbols(cfg, symbols),
+            notes=notes,
+        )
+        typer.echo(json.dumps(serialize_research_task(task), ensure_ascii=False, indent=2))
+
+    _run_cli_json_command("research-create-task", _execute)
 
 
 @app.command("research-list-tasks")
@@ -3049,26 +2514,29 @@ def research_register_candidate(
     thesis: str = typer.Option("", help="One-paragraph strategy thesis."),
     tags: str | None = typer.Option(None, help="Optional comma-separated tags."),
 ) -> None:
-    cfg, session_factory = _load_runtime_context(config=config, project_root=project_root)
-    init_db(cfg.database.url)
-    candidate = register_strategy_candidate(
-        session_factory=session_factory,
-        candidate_name=name,
-        task_id=task_id,
-        strategy_name=strategy_name or cfg.strategy.name,
-        variant=variant or cfg.strategy.variant,
-        timeframe=timeframe or cfg.strategy.signal_bar,
-        symbol_scope=_resolve_symbols(cfg, symbols),
-        config_path=str(config_path) if config_path else str(config),
-        author_role=author_role,
-        thesis=thesis,
-        tags=_parse_text_list(tags) if tags else [],
-        details={
-            "project_root": str(project_root.resolve()),
-            "config_path": str((config_path or config).resolve()),
-        },
-    )
-    typer.echo(json.dumps(serialize_strategy_candidate(candidate), ensure_ascii=False, indent=2))
+    def _execute() -> None:
+        cfg, session_factory = _load_runtime_context(config=config, project_root=project_root)
+        init_db(cfg.database.url)
+        candidate = register_strategy_candidate(
+            session_factory=session_factory,
+            candidate_name=name,
+            task_id=task_id,
+            strategy_name=strategy_name or cfg.strategy.name,
+            variant=variant or cfg.strategy.variant,
+            timeframe=timeframe or cfg.strategy.signal_bar,
+            symbol_scope=_resolve_symbols(cfg, symbols),
+            config_path=str(config_path) if config_path else str(config),
+            author_role=author_role,
+            thesis=thesis,
+            tags=_parse_text_list(tags) if tags else [],
+            details={
+                "project_root": str(project_root.resolve()),
+                "config_path": str((config_path or config).resolve()),
+            },
+        )
+        typer.echo(json.dumps(serialize_strategy_candidate(candidate), ensure_ascii=False, indent=2))
+
+    _run_cli_json_command("research-register-candidate", _execute)
 
 
 @app.command("research-list-candidates")
@@ -3116,43 +2584,47 @@ def research_evaluate_candidate(
     evaluation_type: str = typer.Option("backtest", help="Evaluation type label."),
     notes: str = typer.Option("", help="Free-form evaluator notes."),
 ) -> None:
-    cfg, session_factory = _load_runtime_context(config=config, project_root=project_root)
-    init_db(cfg.database.url)
-    try:
-        inferred = infer_strategy_candidate_artifacts_by_id(
+    def _execute() -> None:
+        cfg, session_factory = _load_runtime_context(config=config, project_root=project_root)
+        init_db(cfg.database.url)
+        try:
+            inferred = infer_strategy_candidate_artifacts_by_id(
+                session_factory=session_factory,
+                candidate_id=candidate_id,
+                project_root=project_root.resolve(),
+            )
+        except Exception:
+            inferred = infer_candidate_artifacts(config=cfg, project_root=project_root.resolve())
+        if summary_path is None and not Path(inferred["summary_path"]).exists():
+            inferred = infer_candidate_artifacts(config=cfg, project_root=project_root.resolve())
+        resolved_summary = summary_path or Path(inferred["summary_path"])
+        resolved_report = report_path or Path(inferred["report_path"])
+        resolved_trades = trades_path or Path(inferred["trades_path"])
+        resolved_equity = equity_curve_path or Path(inferred["equity_curve_path"])
+        candidate, report = evaluate_strategy_candidate(
             session_factory=session_factory,
             candidate_id=candidate_id,
-            project_root=project_root.resolve(),
+            evaluator_role=evaluator_role,
+            evaluation_type=evaluation_type,
+            summary_path=resolved_summary,
+            report_path=resolved_report if resolved_report.exists() else None,
+            trades_path=resolved_trades if resolved_trades.exists() else None,
+            equity_curve_path=resolved_equity if resolved_equity.exists() else None,
+            notes=notes,
+            artifact_payload_source=inferred,
         )
-    except Exception:
-        inferred = infer_candidate_artifacts(config=cfg, project_root=project_root.resolve())
-    if summary_path is None and not Path(inferred["summary_path"]).exists():
-        inferred = infer_candidate_artifacts(config=cfg, project_root=project_root.resolve())
-    resolved_summary = summary_path or Path(inferred["summary_path"])
-    resolved_report = report_path or Path(inferred["report_path"])
-    resolved_trades = trades_path or Path(inferred["trades_path"])
-    resolved_equity = equity_curve_path or Path(inferred["equity_curve_path"])
-    candidate, report = evaluate_strategy_candidate(
-        session_factory=session_factory,
-        candidate_id=candidate_id,
-        evaluator_role=evaluator_role,
-        evaluation_type=evaluation_type,
-        summary_path=resolved_summary,
-        report_path=resolved_report if resolved_report.exists() else None,
-        trades_path=resolved_trades if resolved_trades.exists() else None,
-        equity_curve_path=resolved_equity if resolved_equity.exists() else None,
-        notes=notes,
-    )
-    typer.echo(
-        json.dumps(
-            {
-                "candidate": serialize_strategy_candidate(candidate),
-                "evaluation_report": serialize_evaluation_report(report),
-            },
-            ensure_ascii=False,
-            indent=2,
+        typer.echo(
+            json.dumps(
+                {
+                    "candidate": serialize_strategy_candidate(candidate),
+                    "evaluation_report": serialize_evaluation_report(report),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
         )
-    )
+
+    _run_cli_json_command("research-evaluate-candidate", _execute)
 
 
 @app.command("research-approve-candidate")
@@ -3165,26 +2637,29 @@ def research_approve_candidate(
     decider_role: str = typer.Option("risk_officer", help="Research role recording the decision."),
     reason: str = typer.Option("", help="Approval or rejection reason."),
 ) -> None:
-    cfg, session_factory = _load_runtime_context(config=config, project_root=project_root)
-    init_db(cfg.database.url)
-    candidate, approval = approve_strategy_candidate(
-        session_factory=session_factory,
-        candidate_id=candidate_id,
-        decision=decision,
-        scope=scope,
-        decider_role=decider_role,
-        reason=reason,
-    )
-    typer.echo(
-        json.dumps(
-            {
-                "candidate": serialize_strategy_candidate(candidate),
-                "approval": serialize_approval_decision(approval),
-            },
-            ensure_ascii=False,
-            indent=2,
+    def _execute() -> None:
+        cfg, session_factory = _load_runtime_context(config=config, project_root=project_root)
+        init_db(cfg.database.url)
+        candidate, approval = approve_strategy_candidate(
+            session_factory=session_factory,
+            candidate_id=candidate_id,
+            decision=decision,
+            scope=scope,
+            decider_role=decider_role,
+            reason=reason,
         )
-    )
+        typer.echo(
+            json.dumps(
+                {
+                    "candidate": serialize_strategy_candidate(candidate),
+                    "approval": serialize_approval_decision(approval),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+
+    _run_cli_json_command("research-approve-candidate", _execute)
 
 
 @app.command("research-backtest-candidate")
@@ -3200,26 +2675,29 @@ def research_backtest_candidate(
     evaluator_role: str = typer.Option("backtest_validator", help="Research role recorded on the evaluation."),
     notes: str = typer.Option("", help="Optional evaluation notes."),
 ) -> None:
-    cfg, session_factory = _load_runtime_context(config=config, project_root=project_root)
-    init_db(cfg.database.url)
-    if evaluate:
-        payload = evaluate_backtested_candidate(
-            session_factory=session_factory,
-            candidate_id=candidate_id,
-            project_root=project_root.resolve(),
-            build_report=build_report,
-            evaluator_role=evaluator_role,
-            evaluation_type="backtest",
-            notes=notes,
-        )
-    else:
-        payload = backtest_strategy_candidate(
-            session_factory=session_factory,
-            candidate_id=candidate_id,
-            project_root=project_root.resolve(),
-            build_report=build_report,
-        )
-    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+    def _execute() -> None:
+        cfg, session_factory = _load_runtime_context(config=config, project_root=project_root)
+        init_db(cfg.database.url)
+        if evaluate:
+            payload = evaluate_backtested_candidate(
+                session_factory=session_factory,
+                candidate_id=candidate_id,
+                project_root=project_root.resolve(),
+                build_report=build_report,
+                evaluator_role=evaluator_role,
+                evaluation_type="backtest",
+                notes=notes,
+            )
+        else:
+            payload = backtest_strategy_candidate(
+                session_factory=session_factory,
+                candidate_id=candidate_id,
+                project_root=project_root.resolve(),
+                build_report=build_report,
+            )
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+    _run_cli_json_command("research-backtest-candidate", _execute)
 
 
 @app.command("research-bind-candidate")
@@ -3297,7 +2775,7 @@ def research_overview(
     config: Path = typer.Option(..., exists=True, dir_okay=False, help="Path to the YAML config file."),
     project_root: Path = typer.Option(Path("."), file_okay=False, help="Project root for storage paths."),
     limit: int = typer.Option(10, min=1, max=100, help="Max number of rows per section."),
-) -> None:
+    ) -> None:
     cfg, session_factory = _load_runtime_context(config=config, project_root=project_root)
     init_db(cfg.database.url)
     typer.echo(
@@ -3307,6 +2785,28 @@ def research_overview(
             indent=2,
         )
     )
+
+
+@app.command("market-data-status")
+def market_data_status(
+    config: Path = typer.Option(..., exists=True, dir_okay=False, help="Path to the YAML config file."),
+    project_root: Path = typer.Option(Path("."), file_okay=False, help="Project root for storage paths."),
+    probe: bool = typer.Option(False, help="Send a lightweight probe request to the configured market data provider."),
+) -> None:
+    cfg = _load_app_context(config=config, project_root=project_root)
+    payload = build_market_data_status(config=cfg, probe=probe)
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@app.command("integration-status")
+def integration_status(
+    config: Path = typer.Option(..., exists=True, dir_okay=False, help="Path to the YAML config file."),
+    project_root: Path = typer.Option(Path("."), file_okay=False, help="Project root for storage paths."),
+    probe: bool = typer.Option(False, help="Send lightweight probe requests to configured integrations."),
+) -> None:
+    cfg = _load_app_context(config=config, project_root=project_root)
+    payload = build_integration_overview(config=cfg, probe=probe)
+    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 @app.command("research-ai-status")
@@ -3334,29 +2834,90 @@ def research_ai_run(
     temperature: float | None = typer.Option(None, help="Optional sampling temperature override."),
     max_output_tokens: int | None = typer.Option(None, min=1, help="Optional output token cap override."),
 ) -> None:
-    cfg = _load_app_context(config=config, project_root=project_root)
-    context: dict[str, Any] = {}
-    if context_json:
-        try:
-            parsed = json.loads(context_json)
-        except json.JSONDecodeError as exc:
-            raise typer.BadParameter(f"Invalid --context-json payload: {exc}") from exc
-        if not isinstance(parsed, dict):
-            raise typer.BadParameter("--context-json must decode into a JSON object.")
-        context = parsed
+    def _execute() -> None:
+        cfg = _load_app_context(config=config, project_root=project_root)
+        payload = run_research_ai_request(
+            config=cfg,
+            request=ResearchAIRequest(
+                role=role,
+                task=task,
+                context=_parse_context_json_option(context_json),
+                system_prompt=system_prompt,
+                temperature=temperature,
+                max_output_tokens=max_output_tokens,
+            ),
+        )
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
 
-    payload = run_research_ai_request(
-        config=cfg,
-        request=ResearchAIRequest(
-            role=role,
-            task=task,
-            context=context,
-            system_prompt=system_prompt,
-            temperature=temperature,
-            max_output_tokens=max_output_tokens,
-        ),
-    )
+    _run_cli_json_command("research-ai-run", _execute)
+
+
+@app.command("research-agent-status")
+def research_agent_status(
+    config: Path = typer.Option(..., exists=True, dir_okay=False, help="Path to the YAML config file."),
+    project_root: Path = typer.Option(Path("."), file_okay=False, help="Project root for storage paths."),
+    probe: bool = typer.Option(False, help="Send a lightweight probe request to the configured external agent."),
+) -> None:
+    cfg = _load_app_context(config=config, project_root=project_root)
+    payload = build_research_agent_status(config=cfg, probe=probe)
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+@app.command("research-agent-run")
+def research_agent_run(
+    config: Path = typer.Option(..., exists=True, dir_okay=False, help="Path to the YAML config file."),
+    project_root: Path = typer.Option(Path("."), file_okay=False, help="Project root for storage paths."),
+    task: str = typer.Option(..., help="Research task sent to the configured external agent."),
+    role: str = typer.Option("research_lead", help="Research role used for the external agent workflow."),
+    title: str | None = typer.Option(None, help="Optional research task title override."),
+    hypothesis: str = typer.Option("", help="Optional research hypothesis stored with the task."),
+    symbols: str | None = typer.Option(None, help="Optional comma-separated symbols. Defaults to configured symbols."),
+    context_json: str | None = typer.Option(None, help="Optional JSON object containing structured context."),
+    task_id: int | None = typer.Option(None, help="Optional existing research task id."),
+    create_task: bool = typer.Option(True, help="Create a research task when task_id is not provided."),
+    register_candidate: bool = typer.Option(True, help="Register a draft strategy candidate from the agent output."),
+    owner_role: str = typer.Option("research_lead", help="Owner role for an auto-created research task."),
+    author_role: str = typer.Option("strategy_builder", help="Author role recorded on the created candidate."),
+    priority: str = typer.Option("high", help="Priority recorded on an auto-created research task."),
+    notes: str = typer.Option("", help="Optional notes stored on the created task."),
+    candidate_name: str | None = typer.Option(None, help="Optional candidate name override."),
+    strategy_name: str | None = typer.Option(None, help="Optional strategy name override."),
+    variant: str | None = typer.Option(None, help="Optional strategy variant override."),
+    timeframe: str | None = typer.Option(None, help="Optional timeframe override."),
+    thesis: str | None = typer.Option(None, help="Optional thesis override."),
+    tags: str | None = typer.Option(None, help="Optional comma-separated tags."),
+) -> None:
+    def _execute() -> None:
+        cfg, session_factory = _load_runtime_context(config=config, project_root=project_root)
+        init_db(cfg.database.url)
+        payload = run_research_agent_workflow(
+            config=cfg,
+            session_factory=session_factory,
+            request=ResearchAgentRequest(
+                role=role,
+                task=task,
+                title=title,
+                hypothesis=hypothesis,
+                symbols=_resolve_symbols(cfg, symbols),
+                context=_parse_context_json_option(context_json),
+                task_id=task_id,
+                create_task=create_task,
+                register_candidate=register_candidate,
+                owner_role=owner_role,
+                author_role=author_role,
+                priority=priority,
+                notes=notes,
+                candidate_name=candidate_name,
+                strategy_name=strategy_name,
+                variant=variant,
+                timeframe=timeframe,
+                thesis=thesis,
+                tags=_parse_text_list(tags) if tags else [],
+            ),
+        )
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+    _run_cli_json_command("research-agent-run", _execute)
 
 
 @app.command("research-materialize-top")
@@ -3376,30 +2937,35 @@ def research_materialize_top(
     author_role: str = typer.Option("strategy_builder", help="Role recorded on the generated candidates."),
     notes: str = typer.Option("", help="Optional notes stored on the auto-created research task."),
 ) -> None:
-    cfg, session_factory = _load_runtime_context(config=config, project_root=project_root)
-    init_db(cfg.database.url)
-    storage = cfg.storage.resolved(project_root.resolve())
-    symbol_slug = _symbol_slug(cfg.instrument.symbol)
-    resolved_results_path = results_path or (storage.report_dir / f"{symbol_slug}_{cfg.strategy.name}_trend_research.csv")
-    if not resolved_results_path.exists():
-        raise typer.BadParameter(f"Trend research CSV not found: {resolved_results_path}")
+    def _execute() -> None:
+        cfg, session_factory = _load_runtime_context(config=config, project_root=project_root)
+        init_db(cfg.database.url)
+        resolved_results_path = resolve_project_research_results_path(
+            config=cfg,
+            project_root=project_root.resolve(),
+            results_path=results_path,
+        )
+        if not resolved_results_path.exists():
+            raise typer.BadParameter(f"Trend research CSV not found: {resolved_results_path}")
 
-    results = pd.read_csv(resolved_results_path)
-    payload = materialize_trend_research_candidates(
-        session_factory=session_factory,
-        config=cfg,
-        project_root=project_root,
-        base_config_path=config,
-        results_frame=results,
-        results_path=resolved_results_path,
-        top_n=top_n,
-        task_id=task_id,
-        task_title=task_title,
-        owner_role=owner_role,
-        author_role=author_role,
-        notes=notes,
-    )
-    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        results = pd.read_csv(resolved_results_path)
+        payload = materialize_trend_research_candidates(
+            session_factory=session_factory,
+            config=cfg,
+            project_root=project_root,
+            base_config_path=config,
+            results_frame=results,
+            results_path=resolved_results_path,
+            top_n=top_n,
+            task_id=task_id,
+            task_title=task_title,
+            owner_role=owner_role,
+            author_role=author_role,
+            notes=notes,
+        )
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+    _run_cli_json_command("research-materialize-top", _execute)
 
 
 @app.command("research-promote-top")
@@ -3421,32 +2987,37 @@ def research_promote_top(
     build_report: bool = typer.Option(True, help="Render HTML dashboard for each promoted candidate."),
     notes: str = typer.Option("", help="Optional notes stored on the auto-created research task."),
 ) -> None:
-    cfg, session_factory = _load_runtime_context(config=config, project_root=project_root)
-    init_db(cfg.database.url)
-    storage = cfg.storage.resolved(project_root.resolve())
-    symbol_slug = _symbol_slug(cfg.instrument.symbol)
-    resolved_results_path = results_path or (storage.report_dir / f"{symbol_slug}_{cfg.strategy.name}_trend_research.csv")
-    if not resolved_results_path.exists():
-        raise typer.BadParameter(f"Trend research CSV not found: {resolved_results_path}")
+    def _execute() -> None:
+        cfg, session_factory = _load_runtime_context(config=config, project_root=project_root)
+        init_db(cfg.database.url)
+        resolved_results_path = resolve_project_research_results_path(
+            config=cfg,
+            project_root=project_root.resolve(),
+            results_path=results_path,
+        )
+        if not resolved_results_path.exists():
+            raise typer.BadParameter(f"Trend research CSV not found: {resolved_results_path}")
 
-    results = pd.read_csv(resolved_results_path)
-    payload = promote_trend_research_candidates(
-        session_factory=session_factory,
-        config=cfg,
-        project_root=project_root.resolve(),
-        base_config_path=config,
-        results_frame=results,
-        results_path=resolved_results_path,
-        top_n=top_n,
-        task_id=task_id,
-        task_title=task_title,
-        owner_role=owner_role,
-        author_role=author_role,
-        evaluator_role=evaluator_role,
-        notes=notes,
-        build_report=build_report,
-    )
-    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        results = pd.read_csv(resolved_results_path)
+        payload = promote_trend_research_candidates(
+            session_factory=session_factory,
+            config=cfg,
+            project_root=project_root.resolve(),
+            base_config_path=config,
+            results_frame=results,
+            results_path=resolved_results_path,
+            top_n=top_n,
+            task_id=task_id,
+            task_title=task_title,
+            owner_role=owner_role,
+            author_role=author_role,
+            evaluator_role=evaluator_role,
+            notes=notes,
+            build_report=build_report,
+        )
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+    _run_cli_json_command("research-promote-top", _execute)
 
 
 @app.command("research-routed-backtest")
@@ -3494,28 +3065,62 @@ def research_routed_backtest(
             routed.route_summary,
         )
         report_prefix = output_prefix or f"{symbol_slug}_{cfg.strategy.name}_routed"
+        artifact_identity = None
+        if output_prefix is None:
+            artifact_identity = routed_backtest_artifact_identity(
+                config=cfg,
+                project_root=project_root.resolve(),
+                symbols=resolved_symbols,
+                required_scope=required_scope,
+            )
+            routed_paths = report_runtime.routed_artifact_paths(
+                storage=storage,
+                artifact_identity=artifact_identity,
+                include_dashboard=True,
+                include_routes=True,
+            )
+            dashboard_path = routed_paths["dashboard"]
+        else:
+            dashboard_path = storage.report_dir / f"{report_prefix}_dashboard.html"
         trades_path, equity_path, summary_path = _write_backtest_artifacts(
             storage=storage,
             report_prefix=report_prefix,
             trades_frame=_trades_frame(routed.artifacts.trades),
             equity_curve=routed.artifacts.equity_curve,
             summary=summary,
+            signal_frame=routed.artifacts.signal_frame,
+            execution_bars=execution_bars,
+            artifact_identity=artifact_identity,
         )
         route_path, route_summary_path = _write_routing_artifacts(
             storage=storage,
             report_prefix=report_prefix,
             route_frame=routed.route_frame,
             route_summary=routed.route_summary,
+            artifact_identity=artifact_identity,
         )
-        dashboard_path = storage.report_dir / f"{report_prefix}_dashboard.html"
         render_dashboard(
             summary_path=summary_path,
             equity_curve_path=equity_path,
             trades_path=trades_path,
             output_path=dashboard_path,
-            title=f"{symbol} {cfg.strategy.name} Routed",
+            title=f"{symbol} {cfg.strategy.name} 路由回测",
         )
-        typer.echo("Routed backtest complete.")
+        if artifact_identity is not None:
+            register_artifact_group(
+                report_dir=storage.report_dir,
+                identity=artifact_identity,
+                artifacts={"dashboard": dashboard_path},
+                legacy_artifact_sets=[
+                    report_runtime.routed_legacy_artifact_paths(
+                        storage=storage,
+                        report_prefix=report_prefix,
+                        include_dashboard=True,
+                        include_routes=True,
+                    )
+                ],
+            )
+        typer.echo("路由回测完成。")
         typer.echo(json.dumps(summary, ensure_ascii=False, indent=2))
         typer.echo(f"Trades: {trades_path}")
         typer.echo(f"Equity curve: {equity_path}")
@@ -3531,6 +3136,7 @@ def research_routed_backtest(
     storage = cfg.storage
     per_symbol_initial_equity = cfg.execution.initial_equity / len(resolved_symbols)
     equity_curves_by_symbol: dict[str, pd.DataFrame] = {}
+    artifacts_by_symbol: dict[str, BacktestArtifacts] = {}
     trades_by_symbol: dict[str, list[TradeRecord]] = {}
     all_trades: list[TradeRecord] = []
     sleeve_summaries: list[dict[str, object]] = []
@@ -3571,26 +3177,56 @@ def research_routed_backtest(
         sleeve_summaries.append(summary)
 
         report_prefix = f"{symbol_slug}_{cfg.strategy.name}_routed_sleeve"
+        artifact_identity = routed_backtest_sleeve_artifact_identity(
+            config=cfg,
+            project_root=project_root.resolve(),
+            portfolio_symbols=resolved_symbols,
+            symbol=symbol,
+            required_scope=required_scope,
+        )
+        routed_paths = report_runtime.routed_artifact_paths(
+            storage=storage,
+            artifact_identity=artifact_identity,
+            include_dashboard=True,
+            include_routes=True,
+        )
         trades_path, equity_path, summary_path = _write_backtest_artifacts(
             storage=storage,
             report_prefix=report_prefix,
             trades_frame=_trades_frame(routed.artifacts.trades),
             equity_curve=routed.artifacts.equity_curve,
             summary=summary,
+            signal_frame=routed.artifacts.signal_frame,
+            execution_bars=execution_bars,
+            artifact_identity=artifact_identity,
         )
         route_path, route_summary_path = _write_routing_artifacts(
             storage=storage,
             report_prefix=report_prefix,
             route_frame=routed.route_frame,
             route_summary=routed.route_summary,
+            artifact_identity=artifact_identity,
         )
-        dashboard_path = storage.report_dir / f"{report_prefix}_dashboard.html"
+        dashboard_path = routed_paths["dashboard"]
         render_dashboard(
             summary_path=summary_path,
             equity_curve_path=equity_path,
             trades_path=trades_path,
             output_path=dashboard_path,
-            title=f"{symbol} {cfg.strategy.name} Routed Sleeve",
+            title=f"{symbol} {cfg.strategy.name} 路由子报表",
+        )
+        register_artifact_group(
+            report_dir=storage.report_dir,
+            identity=artifact_identity,
+            artifacts={"dashboard": dashboard_path},
+            legacy_artifact_sets=[
+                report_runtime.routed_legacy_artifact_paths(
+                    storage=storage,
+                    report_prefix=report_prefix,
+                    include_dashboard=True,
+                    include_routes=True,
+                )
+            ],
         )
         sleeve_artifacts.append(
             {
@@ -3605,6 +3241,7 @@ def research_routed_backtest(
         )
 
         equity_curves_by_symbol[symbol] = routed.artifacts.equity_curve
+        artifacts_by_symbol[symbol] = routed.artifacts
         trades_by_symbol[symbol] = routed.artifacts.trades
         all_trades.extend(routed.artifacts.trades)
         route_frames.append(routed.route_frame)
@@ -3622,35 +3259,76 @@ def research_routed_backtest(
         ),
         portfolio_route_summary,
     )
-    portfolio_summary["allocation_mode"] = "equal_weight"
-    portfolio_summary["per_symbol_initial_equity"] = round(per_symbol_initial_equity, 2)
+    portfolio_summary = attach_equal_weight_portfolio_construction(
+        portfolio_summary,
+        per_symbol_initial_equity=per_symbol_initial_equity,
+    )
+    portfolio_allocation_overlay = build_portfolio_risk_budget_overlay(
+        symbol_artifacts=artifacts_by_symbol,
+        execution_config=cfg.execution,
+        risk_config=cfg.risk,
+    )
+    portfolio_summary = attach_portfolio_risk_budget_overlay(
+        portfolio_summary,
+        allocation_frame=portfolio_allocation_overlay,
+    )
 
     portfolio_prefix = f"{_portfolio_report_prefix(resolved_symbols, cfg.strategy.name)}_routed"
+    artifact_identity = routed_backtest_artifact_identity(
+        config=cfg,
+        project_root=project_root.resolve(),
+        symbols=resolved_symbols,
+        required_scope=required_scope,
+    )
+    routed_paths = report_runtime.routed_artifact_paths(
+        storage=storage,
+        artifact_identity=artifact_identity,
+        include_dashboard=True,
+        include_allocation_overlay=True,
+        include_routes=True,
+    )
     trades_path, equity_path, summary_path = _write_backtest_artifacts(
         storage=storage,
         report_prefix=portfolio_prefix,
         trades_frame=portfolio_trades,
         equity_curve=portfolio_equity,
         summary=portfolio_summary,
+        allocation_overlay=portfolio_allocation_overlay,
+        artifact_identity=artifact_identity,
     )
     route_path, route_summary_path = _write_routing_artifacts(
         storage=storage,
         report_prefix=portfolio_prefix,
         route_frame=combined_route_frame,
         route_summary=portfolio_route_summary,
+        artifact_identity=artifact_identity,
     )
     sleeves_path = storage.report_dir / f"{portfolio_prefix}_sleeves.csv"
     pd.DataFrame(sleeve_summaries).to_csv(sleeves_path, index=False)
-    dashboard_path = storage.report_dir / f"{portfolio_prefix}_dashboard.html"
+    dashboard_path = routed_paths["dashboard"]
     render_dashboard(
         summary_path=summary_path,
         equity_curve_path=equity_path,
         trades_path=trades_path,
         output_path=dashboard_path,
-        title=f"Portfolio {_symbol_list_label(resolved_symbols)} {cfg.strategy.name} Routed",
+        title=f"组合 {_symbol_list_label(resolved_symbols)} {cfg.strategy.name} 路由回测",
+    )
+    register_artifact_group(
+        report_dir=storage.report_dir,
+        identity=artifact_identity,
+        artifacts={"dashboard": dashboard_path},
+        legacy_artifact_sets=[
+            report_runtime.routed_legacy_artifact_paths(
+                storage=storage,
+                report_prefix=portfolio_prefix,
+                include_dashboard=True,
+                include_allocation_overlay=True,
+                include_routes=True,
+            )
+        ],
     )
 
-    typer.echo("Portfolio routed backtest complete.")
+    typer.echo("组合路由回测完成。")
     typer.echo(json.dumps(portfolio_summary, ensure_ascii=False, indent=2))
     typer.echo(f"Portfolio trades: {trades_path}")
     typer.echo(f"Portfolio equity curve: {equity_path}")
@@ -3752,7 +3430,8 @@ def demo_reconcile(
         session_factory=session_factory,
         project_root=project_root.resolve(),
     )
-    executor_state = _load_executor_state(_executor_state_path(cfg))
+    state_info = _executor_state_info(cfg, mode="single")
+    executor_state = _load_executor_state(_executor_state_path(cfg, mode="single"))
     payload = _build_demo_reconcile_payload(
         cfg=cfg,
         account=account,
@@ -3762,6 +3441,11 @@ def demo_reconcile(
         state=state,
         executor_state=executor_state,
     )
+    state_reason = _executor_state_gate_reason(state_info)
+    if state_reason:
+        warnings = payload.get("warnings")
+        if isinstance(warnings, list):
+            warnings.append(state_reason)
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
@@ -3810,7 +3494,8 @@ def demo_portfolio_reconcile(
         session_factory=session_factory,
         project_root=project_root.resolve(),
     )
-    executor_state = _load_executor_state(_executor_state_path(cfg))
+    state_info = _executor_state_info(cfg, mode="portfolio")
+    executor_state = _load_executor_state(_executor_state_path(cfg, mode="portfolio"))
     payload = _build_demo_portfolio_payload(
         cfg=cfg,
         account=account,
@@ -3818,6 +3503,11 @@ def demo_portfolio_reconcile(
         include_exchange_checks=True,
         executor_state=executor_state,
     )
+    state_reason = _executor_state_gate_reason(state_info)
+    if state_reason:
+        warnings = payload.get("warnings")
+        if isinstance(warnings, list):
+            warnings.append(state_reason)
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
@@ -3835,16 +3525,20 @@ def demo_align_leverage(
         ),
     ),
 ) -> None:
-    cfg = _load_app_context(config=config, project_root=project_root)
-    payload, success = _run_demo_align_leverage_action(
-        cfg,
-        apply=apply,
-        confirm=confirm,
-        rearm_protective_stop=rearm_protective_stop,
-    )
-    typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
-    if apply and not success:
-        raise typer.Exit(code=1)
+    def _execute() -> None:
+        cfg = _load_app_context(config=config, project_root=project_root)
+        payload, success = _run_demo_align_leverage_action(
+            cfg,
+            project_root=project_root,
+            apply=apply,
+            confirm=confirm,
+            rearm_protective_stop=rearm_protective_stop,
+        )
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        if apply and not success:
+            raise typer.Exit(code=1)
+
+    _run_cli_json_command("demo-align-leverage", _execute)
 
 
 @app.command("demo-preflight")
@@ -3934,24 +3628,18 @@ def demo_execute(
         )
         return
 
-    _validate_submit_permissions(cfg, session_factory, confirm)
+    route_decisions = {}
     router_decision = state.get("router_decision")
-    if isinstance(router_decision, dict) and router_decision.get("enabled") and not router_decision.get("ready"):
-        typer.echo(
-            _dump_demo_state(
-                cfg=cfg,
-                account=account,
-                position=position,
-                signal=state["signal"],
-                plan=plan,
-                extra={
-                    "submitted": False,
-                    "reason": "Strategy router did not resolve an executable approved candidate.",
-                    "router_decision": router_decision,
-                },
-            )
-        )
-        raise typer.Exit(code=1)
+    if isinstance(router_decision, dict):
+        route_decisions[cfg.instrument.symbol] = router_decision
+    _validate_submit_permissions(
+        cfg,
+        session_factory,
+        confirm,
+        project_root=project_root.resolve(),
+        mode="single",
+        route_decisions=route_decisions or None,
+    )
     if account.account_mode and account.account_mode != cfg.trading.position_mode:
         raise typer.BadParameter(
             f"Account posMode={account.account_mode}, but config expects {cfg.trading.position_mode}."
@@ -4000,12 +3688,18 @@ def demo_loop(
     cfg, session_factory = _load_runtime_context(config=config, project_root=project_root)
     init_db(cfg.database.url)
     loop_interval = interval_seconds or cfg.trading.poll_interval_seconds
-    state_path = _executor_state_path(cfg)
-    if reset_state and state_path.exists():
-        state_path.unlink()
+    state_path = _executor_state_path(cfg, mode="single")
+    if reset_state:
+        _reset_executor_state(state_path)
 
     if submit:
-        _validate_submit_permissions(cfg, session_factory, confirm)
+        _validate_submit_permissions(
+            cfg,
+            session_factory,
+            confirm,
+            project_root=project_root.resolve(),
+            mode="single",
+        )
 
     cycle = 0
     while cycles == 0 or cycle < cycles:
@@ -4057,12 +3751,18 @@ def demo_portfolio_loop(
     init_db(cfg.database.url)
     resolved_symbols = _resolve_symbols(cfg, symbols)
     loop_interval = interval_seconds or cfg.trading.poll_interval_seconds
-    state_path = _executor_state_path(cfg)
-    if reset_state and state_path.exists():
-        state_path.unlink()
+    state_path = _executor_state_path(cfg, mode="portfolio")
+    if reset_state:
+        _reset_executor_state(state_path)
 
     if submit:
-        _validate_submit_permissions(cfg, session_factory, confirm)
+        _validate_submit_permissions(
+            cfg,
+            session_factory,
+            confirm,
+            project_root=project_root.resolve(),
+            mode="portfolio",
+        )
 
     cycle = 0
     while cycles == 0 or cycle < cycles:
@@ -4095,12 +3795,18 @@ def demo_drill(
     resolved_root = project_root.resolve()
     cfg, session_factory = _load_runtime_context(config=config, project_root=project_root)
     init_db(cfg.database.url)
-    state_path = _executor_state_path(cfg)
-    if reset_state and state_path.exists():
-        state_path.unlink()
+    state_path = _executor_state_path(cfg, mode="single")
+    if reset_state:
+        _reset_executor_state(state_path)
 
     if submit:
-        _validate_submit_permissions(cfg, session_factory, confirm)
+        _validate_submit_permissions(
+            cfg,
+            session_factory,
+            confirm,
+            project_root=resolved_root,
+            mode="single",
+        )
 
     cycle_state, had_error = _run_demo_loop_cycle(
         cfg=cfg,
@@ -4161,12 +3867,18 @@ def demo_portfolio_drill(
     cfg, session_factory = _load_runtime_context(config=config, project_root=project_root)
     init_db(cfg.database.url)
     resolved_symbols = _resolve_symbols(cfg, symbols)
-    state_path = _executor_state_path(cfg)
-    if reset_state and state_path.exists():
-        state_path.unlink()
+    state_path = _executor_state_path(cfg, mode="portfolio")
+    if reset_state:
+        _reset_executor_state(state_path)
 
     if submit:
-        _validate_submit_permissions(cfg, session_factory, confirm)
+        _validate_submit_permissions(
+            cfg,
+            session_factory,
+            confirm,
+            project_root=resolved_root,
+            mode="portfolio",
+        )
 
     cycle_state, had_error = _run_demo_portfolio_loop_cycle(
         cfg=cfg,

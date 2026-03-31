@@ -28,3 +28,16 @@ def test_weekly_drawdown_guard_halts_and_resets_next_week() -> None:
     assert guard.update(monday, 10_000) is False
     assert guard.update(tuesday, 9_390) is True
     assert guard.update(next_monday, 9_500) is False
+
+
+def test_weekly_drawdown_guard_does_not_auto_release_on_new_week_while_still_under_water() -> None:
+    guard = WeeklyDrawdownGuard(threshold=0.06)
+    monday = pd.Timestamp("2025-01-06T00:00:00Z")
+    tuesday = pd.Timestamp("2025-01-07T00:00:00Z")
+    next_monday = pd.Timestamp("2025-01-13T00:00:00Z")
+    next_tuesday = pd.Timestamp("2025-01-14T00:00:00Z")
+
+    assert guard.update(monday, 10_000) is False
+    assert guard.update(tuesday, 9_300) is True
+    assert guard.update(next_monday, 9_300) is True
+    assert guard.update(next_tuesday, 9_450) is False

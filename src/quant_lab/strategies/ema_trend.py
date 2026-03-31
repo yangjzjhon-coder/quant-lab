@@ -3,6 +3,7 @@ from __future__ import annotations
 import pandas as pd
 
 from quant_lab.config import StrategyConfig
+from quant_lab.strategy_contracts import apply_signal_contract_columns
 from quant_lab.utils.timeframes import bar_to_timedelta
 
 
@@ -351,7 +352,11 @@ def prepare_signal_frame(candles: pd.DataFrame, config: StrategyConfig) -> pd.Da
         frame.loc[: minimum_history - 1, "desired_side"] = 0
         frame.loc[: minimum_history - 1, "stop_price"] = pd.NA
 
-    return frame
+    return apply_signal_contract_columns(
+        frame,
+        strategy_name=config.name,
+        strategy_variant=normalized_variant,
+    )
 
 
 def _apply_breakout_position_state(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series]:

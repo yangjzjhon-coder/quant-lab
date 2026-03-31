@@ -1,4 +1,6 @@
 .venv/
+.venvs/
+.claude/
 __pycache__/
 .pytest_cache/
 .ruff_cache/
@@ -6,6 +8,8 @@ __pycache__/
 *.pyo
 *.pyd
 .env
+external/TradingAgents/
+uv.lock
 config/settings.yaml
 data/**
 !data/

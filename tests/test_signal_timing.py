@@ -74,3 +74,38 @@ def test_build_signal_events_emits_managed_stop_updates() -> None:
         pd.Timestamp("2025-01-01T12:01:00Z"),
     ]
     assert events[pd.Timestamp("2025-01-01T12:01:00Z")]["stop_price"] == 105.0
+
+
+def test_build_signal_events_carries_contract_regime_metadata() -> None:
+    signal_frame = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(["2025-01-01T00:00:00Z"]),
+            "desired_side": [1],
+            "stop_distance": [10.0],
+            "alpha_regime": ["bull_trend"],
+            "alpha_side": [1],
+            "risk_multiplier": [0.75],
+        }
+    )
+    execution_bars = pd.DataFrame(
+        {
+            "timestamp": pd.to_datetime(
+                [
+                    "2025-01-01T04:00:00Z",
+                    "2025-01-01T04:01:00Z",
+                ]
+            )
+        }
+    )
+
+    events = _build_signal_events(
+        signal_frame=signal_frame,
+        execution_bars=execution_bars,
+        signal_bar="4H",
+        latency_minutes=1,
+    )
+
+    event = events[pd.Timestamp("2025-01-01T04:01:00Z")]
+    assert event["regime"] == "bull_trend"
+    assert event["alpha_side"] == 1
+    assert event["strategy_risk_multiplier"] == 0.75

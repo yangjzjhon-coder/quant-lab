@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import subprocess
 import time
 from pathlib import Path
 
+import httpx
 import pandas as pd
 
 from quant_lab.config import ensure_storage_dirs, load_config
-from quant_lab.data.okx_public_client import OkxPublicClient
+from quant_lab.data.okx_public_client import OkxApiError, OkxPublicClient
 
 
 def fetch_segment(
@@ -27,7 +29,7 @@ def fetch_segment(
             )
             print(f"[{bar}] ok {start_ts} -> {end_ts} rows={len(frame)}", flush=True)
             return frame
-        except Exception as exc:  # pragma: no cover - network dependent helper
+        except (httpx.HTTPError, OkxApiError, subprocess.SubprocessError) as exc:  # pragma: no cover - network dependent helper
             print(
                 f"[{bar}] retry {attempt} failed for {start_ts} -> {end_ts}: {type(exc).__name__}: {exc}",
                 flush=True,

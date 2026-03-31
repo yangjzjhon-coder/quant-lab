@@ -1,0 +1,167 @@
+okx:
+  profile: "okx-live-btc-single"
+  rest_base_url: "https://www.okx.com"
+  use_demo: false
+
+market_data:
+  provider: "okx"
+  base_url: null
+  proxy_url: null
+  timeout_seconds: 20.0
+  api_key: null
+  extra_headers: {}
+  provider_options: {}
+
+instrument:
+  symbol: "BTC-USDT-SWAP"
+  instrument_type: "SWAP"
+  contract_value: 0.01
+  contract_value_currency: "BTC"
+  lot_size: 0.01
+  min_size: 0.01
+  tick_size: 0.1
+  settle_currency: "USDT"
+
+portfolio:
+  symbols:
+    - "BTC-USDT-SWAP"
+
+strategy:
+  name: "breakout_retest_4h"
+  variant: "breakout_retest_regime"
+  signal_bar: "4H"
+  execution_bar: "1m"
+  fast_ema: 12
+  slow_ema: 30
+  trend_ema: 80
+  atr_period: 14
+  atr_stop_multiple: 3.5
+  adx_period: 14
+  adx_threshold: 20.0
+  allow_short: true
+  volume_window: 12
+  min_volume_ratio: 1.1
+  cmf_period: 10
+  min_cmf_abs: 0.03
+  min_body_atr_ratio: 0.3
+  volatility_window: 36
+  min_volatility_ratio: 0.9
+  max_volatility_ratio: 2.0
+  breakout_buffer_atr: 0.05
+  retest_tolerance_atr: 1.5
+  max_breakout_extension_atr: 1.2
+  min_channel_width_atr: 1.2
+
+execution:
+  initial_equity: 10000.0
+  fee_bps: 8.0
+  slippage_bps: 6.0
+  latency_minutes: 1
+  minimum_notional: 25.0
+  max_leverage: 2.0
+  max_bar_participation: 0.05
+  market_impact_bps: 18.0
+  excess_impact_bps: 30.0
+  volatility_impact_share: 0.35
+  funding_interval_hours: 8
+  missing_funding_rate_bps: 1.5
+
+risk:
+  risk_per_trade: 0.01
+  weekly_drawdown_pause: 0.04
+  portfolio_max_total_risk: 0.02
+  portfolio_max_same_direction_risk: 0.02
+
+trading:
+  td_mode: "cross"
+  position_mode: "net_mode"
+  order_type: "market"
+  signal_lookback_bars: 240
+  execution_lookback_bars: 720
+  poll_interval_seconds: 60
+  allow_order_placement: false
+  max_order_contracts: null
+  attach_stop_loss_on_entry: true
+  stop_trigger_price_type: "mark"
+  order_tag: "quantlablive"
+  require_approved_candidate: true
+  execution_candidate_id: 101
+  execution_candidate_name: "btc_breakout_live_v1"
+  strategy_router_enabled: false
+  strategy_router_fallback_to_config: false
+  execution_candidate_map: {}
+
+storage:
+  data_dir: "data"
+  raw_dir: "data/raw"
+  report_dir: "data/reports"
+
+database:
+  url: "sqlite:///data/quant_lab.db"
+
+service:
+  host: "0.0.0.0"
+  port: 18080
+  heartbeat_interval_seconds: 60
+  report_stale_minutes: 180
+
+alerts:
+  telegram_enabled: false
+  telegram_bot_token: null
+  telegram_chat_id: null
+  email_enabled: false
+  email_from: null
+  email_to: []
+  email_subject_prefix: "[quant-lab-live]"
+  smtp_host: null
+  smtp_port: 587
+  smtp_username: null
+  smtp_password: null
+  smtp_use_tls: true
+  smtp_use_ssl: false
+  smtp_timeout_seconds: 20.0
+  send_on_halt: true
+  send_on_recovery: true
+  send_on_report_stale: true
+  send_on_demo_submit: true
+  send_on_demo_error: true
+  demo_error_cooldown_seconds: 900
+
+research_ai:
+  enabled: false
+  provider: "disabled"
+  base_url: null
+  api_key: null
+  model: null
+  timeout_seconds: 60.0
+  temperature: 0.2
+  max_output_tokens: 2000
+  max_retries: 1
+  default_system_prompt: null
+  role_models: {}
+  role_system_prompts: {}
+  extra_headers: {}
+  provider_options: {}
+
+research_agent:
+  enabled: false
+  provider: "disabled"
+  base_url: null
+  api_key: null
+  timeout_seconds: 90.0
+  max_retries: 1
+  workflow_path: "/run"
+  probe_path: "/health"
+  extra_headers: {}
+  local_repo_path: null
+  python_executable: null
+  provider_options: {}
+
+rollout:
+  phase: "live_single"
+  account_profile: "okx-live-btc-single"
+  allowed_symbol: "BTC-USDT-SWAP"
+  required_candidate_id: 101
+  required_candidate_name: "btc_breakout_live_v1"
+  required_signal_bar: "4H"
+  required_execution_bar: "1m"

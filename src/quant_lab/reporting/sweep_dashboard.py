@@ -9,13 +9,13 @@ import plotly.graph_objects as go
 def render_sweep_dashboard(results: pd.DataFrame, output_path: Path, title: str) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if results.empty:
-        output_path.write_text("<html><body><h1>No sweep results.</h1></body></html>", encoding="utf-8")
+        output_path.write_text("<html><body><h1>暂无参数扫描结果。</h1></body></html>", encoding="utf-8")
         return
 
     top = results.head(12).copy()
     scatter_html = _build_scatter(results, title).to_html(
         full_html=False,
-        include_plotlyjs="cdn",
+        include_plotlyjs=True,
         config={"displaylogo": False, "responsive": True},
     )
     heatmap_html = _build_heatmap(results).to_html(
@@ -47,15 +47,15 @@ def _build_scatter(results: pd.DataFrame, title: str) -> go.Figure:
                     "color": results["sharpe"],
                     "colorscale": "Viridis",
                     "showscale": True,
-                    "colorbar": {"title": "Sharpe"},
+                    "colorbar": {"title": "夏普"},
                 },
                 text=results.apply(
                     lambda row: (
                         f"EMA {int(row.fast_ema)}/{int(row.slow_ema)} | "
-                        f"ATRx {row.atr_stop_multiple}<br>"
-                        f"Return: {row.total_return_pct:.2f}%<br>"
-                        f"DD: {row.max_drawdown_pct:.2f}%<br>"
-                        f"Trades: {int(row.trade_count)}"
+                        f"ATR 倍数 {row.atr_stop_multiple}<br>"
+                        f"总收益：{row.total_return_pct:.2f}%<br>"
+                        f"最大回撤：{row.max_drawdown_pct:.2f}%<br>"
+                        f"交易笔数：{int(row.trade_count)}"
                     ),
                     axis=1,
                 ),
@@ -64,13 +64,13 @@ def _build_scatter(results: pd.DataFrame, title: str) -> go.Figure:
         ]
     )
     figure.update_layout(
-        title=f"{title} Sweep: Return vs Drawdown",
+        title=f"{title} 参数扫描：收益 vs 回撤",
         template="plotly_white",
         height=430,
         margin={"l": 40, "r": 20, "t": 60, "b": 40},
     )
-    figure.update_xaxes(title="Max Drawdown %")
-    figure.update_yaxes(title="Total Return %")
+    figure.update_xaxes(title="最大回撤 %")
+    figure.update_yaxes(title="总收益 %")
     return figure
 
 
@@ -89,19 +89,19 @@ def _build_heatmap(results: pd.DataFrame) -> go.Figure:
                 x=[str(value) for value in best.columns],
                 y=[str(value) for value in best.index],
                 colorscale="YlGnBu",
-                colorbar={"title": "Sharpe"},
-                hovertemplate="Fast EMA %{y}<br>Slow EMA %{x}<br>Sharpe %{z:.2f}<extra></extra>",
+                colorbar={"title": "夏普"},
+                hovertemplate="快 EMA %{y}<br>慢 EMA %{x}<br>夏普 %{z:.2f}<extra></extra>",
             )
         ]
     )
     figure.update_layout(
-        title="Best Sharpe by EMA Pair",
+        title="EMA 组合最佳夏普热力图",
         template="plotly_white",
         height=380,
         margin={"l": 40, "r": 20, "t": 60, "b": 40},
     )
-    figure.update_xaxes(title="Slow EMA")
-    figure.update_yaxes(title="Fast EMA")
+    figure.update_xaxes(title="慢 EMA")
+    figure.update_yaxes(title="快 EMA")
     return figure
 
 
@@ -115,15 +115,15 @@ def _build_table(results: pd.DataFrame) -> go.Figure:
             go.Table(
                 header={
                     "values": [
-                        "Fast",
-                        "Slow",
-                        "ATRx",
-                        "Return %",
-                        "Max DD %",
-                        "Sharpe",
-                        "Trades",
-                        "Win Rate %",
-                        "Score",
+                        "快 EMA",
+                        "慢 EMA",
+                        "ATR 倍数",
+                        "收益 %",
+                        "最大回撤 %",
+                        "夏普",
+                        "交易笔数",
+                        "胜率 %",
+                        "评分",
                     ],
                     "fill_color": "#0f766e",
                     "font": {"color": "white", "size": 13},
@@ -149,7 +149,7 @@ def _build_table(results: pd.DataFrame) -> go.Figure:
         ]
     )
     figure.update_layout(
-        title="Top Sweep Results",
+        title="最佳参数组合",
         template="plotly_white",
         height=420,
         margin={"l": 20, "r": 20, "t": 60, "b": 20},
@@ -160,12 +160,12 @@ def _build_table(results: pd.DataFrame) -> go.Figure:
 def _document(title: str, results: pd.DataFrame, scatter_html: str, heatmap_html: str, table_html: str) -> str:
     best = results.iloc[0]
     cards = [
-        ("Combinations", f"{len(results)}"),
-        ("Best EMA", f"{int(best.fast_ema)}/{int(best.slow_ema)}"),
-        ("Best ATRx", f"{best.atr_stop_multiple:.2f}"),
-        ("Best Return", f"{best.total_return_pct:.2f}%"),
-        ("Best Sharpe", f"{best.sharpe:.2f}"),
-        ("Best Max DD", f"{best.max_drawdown_pct:.2f}%"),
+        ("组合数量", f"{len(results)}"),
+        ("最佳 EMA", f"{int(best.fast_ema)}/{int(best.slow_ema)}"),
+        ("最佳 ATR 倍数", f"{best.atr_stop_multiple:.2f}"),
+        ("最佳收益", f"{best.total_return_pct:.2f}%"),
+        ("最佳夏普", f"{best.sharpe:.2f}"),
+        ("最佳最大回撤", f"{best.max_drawdown_pct:.2f}%"),
     ]
     cards_html = "\n".join(
         (
@@ -182,7 +182,7 @@ def _document(title: str, results: pd.DataFrame, scatter_html: str, heatmap_html
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{title} Sweep Dashboard</title>
+  <title>{title} 参数扫描看板</title>
   <style>
     body {{
       margin: 0;
@@ -205,6 +205,7 @@ def _document(title: str, results: pd.DataFrame, scatter_html: str, heatmap_html
     .hero p {{
       margin: 0;
       color: #6b7280;
+      line-height: 1.7;
     }}
     .cards {{
       display: grid;
@@ -252,24 +253,24 @@ def _document(title: str, results: pd.DataFrame, scatter_html: str, heatmap_html
 <body>
   <div class="shell">
     <section class="hero">
-      <h1>{title} Sweep Dashboard</h1>
-      <p>用于比较 EMA 趋势参数组合的本地研究面板。</p>
+      <h1>{title} 参数扫描看板</h1>
+      <p>用于比较 EMA 与 ATR 参数组合的本地研究报表，帮助快速找到收益和回撤更均衡的参数区域。</p>
     </section>
     <section class="cards">
       {cards_html}
     </section>
     <section class="grid">
       <div class="panel">
-        <div class="section-title">Return vs Drawdown</div>
+        <div class="section-title">收益与回撤散点图</div>
         {scatter_html}
       </div>
       <div class="panel">
-        <div class="section-title">EMA Heatmap</div>
+        <div class="section-title">EMA 热力图</div>
         {heatmap_html}
       </div>
     </section>
     <section class="panel">
-      <div class="section-title">Top Results</div>
+      <div class="section-title">最佳结果</div>
       {table_html}
     </section>
   </div>

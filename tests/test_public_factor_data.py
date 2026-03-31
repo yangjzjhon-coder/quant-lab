@@ -157,7 +157,7 @@ def test_download_public_factors_writes_expected_artifacts(tmp_path: Path, monke
             )
 
     monkeypatch.setattr("quant_lab.cli.load_config", lambda _path: cfg)
-    monkeypatch.setattr("quant_lab.cli.OkxPublicClient", FakeClient)
+    monkeypatch.setattr("quant_lab.cli.build_market_data_provider", lambda _cfg: FakeClient())
 
     runner = CliRunner()
     result = runner.invoke(

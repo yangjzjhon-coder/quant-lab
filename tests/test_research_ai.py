@@ -73,7 +73,37 @@ def test_research_ai_status_cli_reports_disabled_by_default(tmp_path: Path) -> N
     assert payload["enabled"] is False
     assert payload["provider"] == "disabled"
     assert payload["ready"] is False
+    assert "disabled" in payload["supported_providers"]
+    assert "openai_compatible" in payload["supported_providers"]
+    assert "disabled" in payload["provider_help"]["available"]
+    assert "openai_compatible" in payload["provider_help"]["available"]
     assert "research_ai is disabled" in payload["warnings"]
+
+
+def test_research_ai_run_cli_returns_structured_error_when_disabled(tmp_path: Path) -> None:
+    config_path = tmp_path / "settings.yaml"
+    config_path.write_text("{}", encoding="utf-8")
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "research-ai-run",
+            "--config",
+            str(config_path),
+            "--project-root",
+            str(tmp_path),
+            "--task",
+            "check disabled provider",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["source"] == "cli"
+    assert payload["command"] == "research-ai-run"
+    assert payload["error_code"] == "research_ai_disabled"
+    assert payload["error_type"] == "configuration_error"
 
 
 def test_service_api_exposes_research_ai_status(tmp_path: Path) -> None:
@@ -99,6 +129,7 @@ def test_service_api_exposes_research_ai_status(tmp_path: Path) -> None:
         assert payload["ready"] is True
         assert payload["api_key_configured"] is True
         assert payload["capabilities"] == ["chat_completion"]
+        assert payload["provider_help"]["required"] == ["base_url", "api_key", "model"]
         assert payload["role_models"]["research_lead"] == "gpt-test"
 
 

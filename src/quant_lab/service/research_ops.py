@@ -9,16 +9,38 @@ import pandas as pd
 import yaml
 from sqlalchemy import desc, select
 
+from quant_lab.application.project_tasks import default_project_research_artifact_resolution
+from quant_lab.application.report_runtime import (
+    backtest_artifact_paths,
+    backtest_legacy_artifact_paths,
+    trades_frame as build_trades_frame,
+    write_backtest_artifacts,
+)
+from quant_lab.artifacts import (
+    artifact_resolution_path,
+    backtest_artifact_resolution,
+    candidate_backtest_artifact_identity,
+    candidate_backtest_artifact_resolution,
+    candidate_backtest_sleeve_artifact_identity,
+    candidate_backtest_sleeve_artifact_resolution,
+    candidate_report_prefix,
+    candidate_sleeve_report_prefix,
+    register_artifact_group,
+)
 from quant_lab.backtest.engine import run_backtest
 from quant_lab.backtest.metrics import build_summary
 from quant_lab.backtest.portfolio import (
+    attach_equal_weight_portfolio_construction,
+    attach_portfolio_risk_budget_overlay,
     build_portfolio_summary,
+    build_portfolio_risk_budget_overlay,
     build_portfolio_trade_frame,
     combine_portfolio_equity_curves,
 )
 from quant_lab.config import AppConfig, InstrumentConfig, configured_symbols, ensure_storage_dirs, load_config
-from quant_lab.data.okx_public_client import OkxPublicClient
-from quant_lab.models import TradeRecord
+from quant_lab.errors import ConfigurationError, InvalidRequestError, NotFoundError
+from quant_lab.models import BacktestArtifacts, TradeRecord
+from quant_lab.providers.market_data import build_market_data_provider
 from quant_lab.reporting.dashboard import render_dashboard
 from quant_lab.service.database import (
     ApprovalDecision,
@@ -27,6 +49,7 @@ from quant_lab.service.database import (
     StrategyCandidate,
     session_scope,
 )
+from quant_lab.service.serialization import serialize_utc_datetime
 
 AI_RESEARCH_ROLES = {
     "research_lead",
@@ -111,7 +134,10 @@ def register_strategy_candidate(
     _validate_role(author_role)
     with session_scope(session_factory) as session:
         if task_id is not None and session.get(ResearchTask, task_id) is None:
-            raise ValueError(f"Research task {task_id} does not exist.")
+            raise NotFoundError(
+                f"Research task {task_id} does not exist.",
+                error_code="research_task_not_found",
+            )
 
         candidate = StrategyCandidate(
             task_id=task_id,
@@ -150,20 +176,39 @@ def list_strategy_candidates(
         return list(session.execute(query).scalars())
 
 
-def infer_candidate_artifacts(*, config: AppConfig, project_root: Path) -> dict[str, str]:
+def infer_candidate_artifacts(*, config: AppConfig, project_root: Path) -> dict[str, Any]:
     storage = config.storage.resolved(project_root.resolve())
-    symbols = configured_symbols(config)
-    if len(symbols) == 1:
-        prefix = f"{symbols[0].replace('/', '-')}_{config.strategy.name}"
-    else:
-        base_assets = "_".join(symbol.split("-")[0].lower() for symbol in symbols)
-        prefix = f"portfolio_{base_assets}_{config.strategy.name}"
-    return {
-        "summary_path": str(storage.report_dir / f"{prefix}_summary.json"),
-        "report_path": str(storage.report_dir / f"{prefix}_dashboard.html"),
-        "equity_curve_path": str(storage.report_dir / f"{prefix}_equity_curve.csv"),
-        "trades_path": str(storage.report_dir / f"{prefix}_trades.csv"),
-    }
+    identity, resolution = backtest_artifact_resolution(
+        config=config,
+        project_root=project_root.resolve(),
+        symbols=configured_symbols(config),
+    )
+    prefix = str(identity["logical_prefix"])
+    return _artifact_bundle_payload(
+        summary_path=artifact_resolution_path(
+            resolution,
+            "summary",
+            storage.report_dir / f"{prefix}_summary.json",
+        ),
+        report_path=artifact_resolution_path(
+            resolution,
+            "dashboard",
+            storage.report_dir / f"{prefix}_dashboard.html",
+        ),
+        trades_path=artifact_resolution_path(
+            resolution,
+            "trades",
+            storage.report_dir / f"{prefix}_trades.csv",
+        ),
+        equity_curve_path=artifact_resolution_path(
+            resolution,
+            "equity_curve",
+            storage.report_dir / f"{prefix}_equity_curve.csv",
+        ),
+        logical_prefix=prefix,
+        artifact_fingerprint=str(resolution.get("artifact_fingerprint") or identity["artifact_fingerprint"]),
+        resolved_via=str(resolution.get("resolved_via") or ""),
+    )
 
 
 def infer_strategy_candidate_artifacts(
@@ -173,46 +218,131 @@ def infer_strategy_candidate_artifacts(
     project_root: Path,
 ) -> dict[str, Any]:
     storage = config.storage.resolved(project_root.resolve())
-    candidate_slug = _slugify(candidate.candidate_name) or f"candidate_{candidate.id}"
     symbols = configured_symbols(config)
     if len(symbols) == 1:
-        prefix = f"candidate_{candidate_slug}"
-        return {
-            "mode": "single",
-            "prefix": prefix,
-            "symbols": symbols,
-            "summary_path": str(storage.report_dir / f"{prefix}_summary.json"),
-            "report_path": str(storage.report_dir / f"{prefix}_dashboard.html"),
-            "equity_curve_path": str(storage.report_dir / f"{prefix}_equity_curve.csv"),
-            "trades_path": str(storage.report_dir / f"{prefix}_trades.csv"),
-            "sleeves": [],
-        }
+        identity, resolution = candidate_backtest_artifact_resolution(
+            config=config,
+            project_root=project_root,
+            candidate_id=candidate.id,
+            candidate_name=candidate.candidate_name,
+            symbols=symbols,
+        )
+        prefix = str(identity["logical_prefix"])
+        legacy_prefix = candidate_report_prefix(candidate.candidate_name)
+        payload = _artifact_bundle_payload(
+            summary_path=artifact_resolution_path(
+                resolution,
+                "summary",
+                storage.report_dir / f"{legacy_prefix}_summary.json",
+            ),
+            report_path=artifact_resolution_path(
+                resolution,
+                "dashboard",
+                storage.report_dir / f"{legacy_prefix}_dashboard.html",
+            ),
+            trades_path=artifact_resolution_path(
+                resolution,
+                "trades",
+                storage.report_dir / f"{legacy_prefix}_trades.csv",
+            ),
+            equity_curve_path=artifact_resolution_path(
+                resolution,
+                "equity_curve",
+                storage.report_dir / f"{legacy_prefix}_equity_curve.csv",
+            ),
+            logical_prefix=prefix,
+            artifact_fingerprint=str(resolution.get("artifact_fingerprint") or identity["artifact_fingerprint"]),
+            resolved_via=str(resolution.get("resolved_via") or ""),
+            sleeves=[],
+        )
+        payload["mode"] = "single"
+        payload["prefix"] = prefix
+        payload["symbols"] = symbols
+        return payload
 
-    portfolio_prefix = f"candidate_{candidate_slug}"
+    portfolio_identity, portfolio_resolution = candidate_backtest_artifact_resolution(
+        config=config,
+        project_root=project_root,
+        candidate_id=candidate.id,
+        candidate_name=candidate.candidate_name,
+        symbols=symbols,
+    )
+    portfolio_prefix = str(portfolio_identity["logical_prefix"])
+    legacy_portfolio_prefix = candidate_report_prefix(candidate.candidate_name)
     sleeves = []
     for symbol in symbols:
-        symbol_slug = _symbol_slug(symbol)
-        sleeve_prefix = f"{portfolio_prefix}_{symbol_slug}_sleeve"
-        sleeves.append(
-            {
-                "symbol": symbol,
-                "prefix": sleeve_prefix,
-                "summary_path": str(storage.report_dir / f"{sleeve_prefix}_summary.json"),
-                "report_path": str(storage.report_dir / f"{sleeve_prefix}_dashboard.html"),
-                "equity_curve_path": str(storage.report_dir / f"{sleeve_prefix}_equity_curve.csv"),
-                "trades_path": str(storage.report_dir / f"{sleeve_prefix}_trades.csv"),
-            }
+        sleeve_identity, sleeve_resolution = candidate_backtest_sleeve_artifact_resolution(
+            config=config,
+            project_root=project_root,
+            candidate_id=candidate.id,
+            candidate_name=candidate.candidate_name,
+            portfolio_symbols=symbols,
+            symbol=symbol,
         )
-    return {
-        "mode": "portfolio",
-        "prefix": portfolio_prefix,
-        "symbols": symbols,
-        "summary_path": str(storage.report_dir / f"{portfolio_prefix}_summary.json"),
-        "report_path": str(storage.report_dir / f"{portfolio_prefix}_dashboard.html"),
-        "equity_curve_path": str(storage.report_dir / f"{portfolio_prefix}_equity_curve.csv"),
-        "trades_path": str(storage.report_dir / f"{portfolio_prefix}_trades.csv"),
-        "sleeves": sleeves,
-    }
+        sleeve_prefix = str(sleeve_identity["logical_prefix"])
+        legacy_sleeve_prefix = candidate_sleeve_report_prefix(candidate.candidate_name, symbol)
+        sleeve_payload = _artifact_bundle_payload(
+            summary_path=artifact_resolution_path(
+                sleeve_resolution,
+                "summary",
+                storage.report_dir / f"{legacy_sleeve_prefix}_summary.json",
+            ),
+            report_path=artifact_resolution_path(
+                sleeve_resolution,
+                "dashboard",
+                storage.report_dir / f"{legacy_sleeve_prefix}_dashboard.html",
+            ),
+            trades_path=artifact_resolution_path(
+                sleeve_resolution,
+                "trades",
+                storage.report_dir / f"{legacy_sleeve_prefix}_trades.csv",
+            ),
+            equity_curve_path=artifact_resolution_path(
+                sleeve_resolution,
+                "equity_curve",
+                storage.report_dir / f"{legacy_sleeve_prefix}_equity_curve.csv",
+            ),
+            logical_prefix=sleeve_prefix,
+            artifact_fingerprint=str(
+                sleeve_resolution.get("artifact_fingerprint") or sleeve_identity["artifact_fingerprint"]
+            ),
+            resolved_via=str(sleeve_resolution.get("resolved_via") or ""),
+        )
+        sleeve_payload["symbol"] = symbol
+        sleeve_payload["prefix"] = sleeve_prefix
+        sleeves.append(sleeve_payload)
+    payload = _artifact_bundle_payload(
+        summary_path=artifact_resolution_path(
+            portfolio_resolution,
+            "summary",
+            storage.report_dir / f"{legacy_portfolio_prefix}_summary.json",
+        ),
+        report_path=artifact_resolution_path(
+            portfolio_resolution,
+            "dashboard",
+            storage.report_dir / f"{legacy_portfolio_prefix}_dashboard.html",
+        ),
+        trades_path=artifact_resolution_path(
+            portfolio_resolution,
+            "trades",
+            storage.report_dir / f"{legacy_portfolio_prefix}_trades.csv",
+        ),
+        equity_curve_path=artifact_resolution_path(
+            portfolio_resolution,
+            "equity_curve",
+            storage.report_dir / f"{legacy_portfolio_prefix}_equity_curve.csv",
+        ),
+        logical_prefix=portfolio_prefix,
+        artifact_fingerprint=str(
+            portfolio_resolution.get("artifact_fingerprint") or portfolio_identity["artifact_fingerprint"]
+        ),
+        resolved_via=str(portfolio_resolution.get("resolved_via") or ""),
+        sleeves=sleeves,
+    )
+    payload["mode"] = "portfolio"
+    payload["prefix"] = portfolio_prefix
+    payload["symbols"] = symbols
+    return payload
 
 
 def infer_strategy_candidate_artifacts_by_id(
@@ -224,7 +354,10 @@ def infer_strategy_candidate_artifacts_by_id(
     with session_scope(session_factory) as session:
         candidate = session.get(StrategyCandidate, candidate_id)
         if candidate is None:
-            raise ValueError(f"Strategy candidate {candidate_id} does not exist.")
+            raise NotFoundError(
+                f"Strategy candidate {candidate_id} does not exist.",
+                error_code="strategy_candidate_not_found",
+            )
     candidate_config_path = _resolve_candidate_config_path(candidate=candidate, project_root=project_root)
     candidate_config = load_config(candidate_config_path)
     candidate_config.storage = candidate_config.storage.resolved(project_root.resolve())
@@ -232,6 +365,256 @@ def infer_strategy_candidate_artifacts_by_id(
         candidate=candidate,
         config=candidate_config,
         project_root=project_root,
+    )
+
+
+def _candidate_backtest_legacy_artifact_sets(
+    *,
+    storage,
+    current_prefix: str,
+    legacy_prefix: str,
+    include_dashboard: bool = False,
+    include_allocation_overlay: bool = False,
+) -> list[dict[str, Path]]:
+    prefixes = [current_prefix]
+    if legacy_prefix != current_prefix:
+        prefixes.append(legacy_prefix)
+    return [
+        backtest_legacy_artifact_paths(
+            storage=storage,
+            report_prefix=prefix,
+            include_dashboard=include_dashboard,
+            include_allocation_overlay=include_allocation_overlay,
+        )
+        for prefix in prefixes
+    ]
+
+
+def _artifact_file_payload(
+    *,
+    path: Path | None,
+    logical_prefix: str | None = None,
+    artifact_fingerprint: str | None = None,
+    resolved_via: str | None = None,
+    canonical_path: Path | None = None,
+    label: str | None = None,
+    url: str | None = None,
+) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    payload = {
+        "path": str(path),
+        "exists": path.exists(),
+        "resolved_via": resolved_via or None,
+        "logical_prefix": logical_prefix,
+        "artifact_fingerprint": artifact_fingerprint,
+        "canonical_path": str(canonical_path or path),
+    }
+    if label is not None:
+        payload["label"] = label
+    if url is not None:
+        payload["url"] = url
+    return payload
+
+
+def _artifact_bundle_payload(
+    *,
+    summary_path: Path,
+    report_path: Path | None,
+    trades_path: Path | None,
+    equity_curve_path: Path | None,
+    logical_prefix: str | None = None,
+    artifact_fingerprint: str | None = None,
+    resolved_via: str | None = None,
+    summary_canonical_path: Path | None = None,
+    report_canonical_path: Path | None = None,
+    trades_canonical_path: Path | None = None,
+    equity_curve_canonical_path: Path | None = None,
+    sleeves: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "summary_path": str(summary_path),
+        "report_path": str(report_path) if report_path is not None else None,
+        "trades_path": str(trades_path) if trades_path is not None else None,
+        "equity_curve_path": str(equity_curve_path) if equity_curve_path is not None else None,
+        "summary_file": _artifact_file_payload(
+            path=summary_path,
+            logical_prefix=logical_prefix,
+            artifact_fingerprint=artifact_fingerprint,
+            resolved_via=resolved_via,
+            canonical_path=summary_canonical_path,
+        ),
+        "report_file": _artifact_file_payload(
+            path=report_path,
+            logical_prefix=logical_prefix,
+            artifact_fingerprint=artifact_fingerprint,
+            resolved_via=resolved_via,
+            canonical_path=report_canonical_path,
+        ),
+        "trades_file": _artifact_file_payload(
+            path=trades_path,
+            logical_prefix=logical_prefix,
+            artifact_fingerprint=artifact_fingerprint,
+            resolved_via=resolved_via,
+            canonical_path=trades_canonical_path,
+        ),
+        "equity_curve_file": _artifact_file_payload(
+            path=equity_curve_path,
+            logical_prefix=logical_prefix,
+            artifact_fingerprint=artifact_fingerprint,
+            resolved_via=resolved_via,
+            canonical_path=equity_curve_canonical_path,
+        ),
+    }
+    if logical_prefix:
+        payload["logical_prefix"] = logical_prefix
+    if artifact_fingerprint:
+        payload["artifact_fingerprint"] = artifact_fingerprint
+    if resolved_via:
+        payload["resolved_via"] = resolved_via
+    if sleeves is not None:
+        payload["sleeves"] = sleeves
+    return payload
+
+
+def _artifact_payload_with_overrides(
+    artifact_payload_source: dict[str, Any] | None,
+    *,
+    summary_path: Path,
+    report_path: Path | None,
+    trades_path: Path | None,
+    equity_curve_path: Path | None,
+) -> dict[str, Any]:
+    source = dict(artifact_payload_source) if isinstance(artifact_payload_source, dict) else {}
+    logical_prefix = str(source.get("logical_prefix") or "") or None
+    artifact_fingerprint = str(source.get("artifact_fingerprint") or "") or None
+    default_resolved_via = str(source.get("resolved_via") or "") or None
+
+    def _source_flat_path(key: str) -> Path | None:
+        raw_value = source.get(key)
+        if raw_value in {"", None}:
+            return None
+        return Path(str(raw_value))
+
+    def _source_file_meta(key: str) -> dict[str, Any]:
+        raw_value = source.get(key)
+        return raw_value if isinstance(raw_value, dict) else {}
+
+    def _resolved_meta(
+        *,
+        flat_key: str,
+        file_key: str,
+        resolved_path: Path | None,
+    ) -> tuple[str | None, Path | None]:
+        if resolved_path is None:
+            return None, None
+        source_path = _source_flat_path(flat_key)
+        source_meta = _source_file_meta(file_key)
+        if source_path is not None and source_path == resolved_path:
+            resolved_via = str(source_meta.get("resolved_via") or default_resolved_via or "") or None
+            canonical_raw = source_meta.get("canonical_path")
+            canonical_path = Path(str(canonical_raw)) if canonical_raw not in {"", None} else resolved_path
+            return resolved_via, canonical_path
+        return "explicit_path", resolved_path
+
+    summary_resolved_via, summary_canonical_path = _resolved_meta(
+        flat_key="summary_path",
+        file_key="summary_file",
+        resolved_path=summary_path,
+    )
+    report_resolved_via, report_canonical_path = _resolved_meta(
+        flat_key="report_path",
+        file_key="report_file",
+        resolved_path=report_path,
+    )
+    trades_resolved_via, trades_canonical_path = _resolved_meta(
+        flat_key="trades_path",
+        file_key="trades_file",
+        resolved_path=trades_path,
+    )
+    equity_curve_resolved_via, equity_curve_canonical_path = _resolved_meta(
+        flat_key="equity_curve_path",
+        file_key="equity_curve_file",
+        resolved_path=equity_curve_path,
+    )
+
+    payload = dict(source)
+    payload.update(
+        _artifact_bundle_payload(
+            summary_path=summary_path,
+            report_path=report_path,
+            trades_path=trades_path,
+            equity_curve_path=equity_curve_path,
+            logical_prefix=logical_prefix,
+            artifact_fingerprint=artifact_fingerprint,
+            resolved_via=summary_resolved_via or default_resolved_via,
+            summary_canonical_path=summary_canonical_path,
+            report_canonical_path=report_canonical_path,
+            trades_canonical_path=trades_canonical_path,
+            equity_curve_canonical_path=equity_curve_canonical_path,
+            sleeves=source.get("sleeves") if isinstance(source.get("sleeves"), list) else None,
+        )
+    )
+    payload["summary_file"] = _artifact_file_payload(
+        path=summary_path,
+        logical_prefix=logical_prefix,
+        artifact_fingerprint=artifact_fingerprint,
+        resolved_via=summary_resolved_via or default_resolved_via,
+        canonical_path=summary_canonical_path,
+    )
+    payload["report_file"] = _artifact_file_payload(
+        path=report_path,
+        logical_prefix=logical_prefix,
+        artifact_fingerprint=artifact_fingerprint,
+        resolved_via=report_resolved_via or default_resolved_via,
+        canonical_path=report_canonical_path,
+    )
+    payload["trades_file"] = _artifact_file_payload(
+        path=trades_path,
+        logical_prefix=logical_prefix,
+        artifact_fingerprint=artifact_fingerprint,
+        resolved_via=trades_resolved_via or default_resolved_via,
+        canonical_path=trades_canonical_path,
+    )
+    payload["equity_curve_file"] = _artifact_file_payload(
+        path=equity_curve_path,
+        logical_prefix=logical_prefix,
+        artifact_fingerprint=artifact_fingerprint,
+        resolved_via=equity_curve_resolved_via or default_resolved_via,
+        canonical_path=equity_curve_canonical_path,
+    )
+    return payload
+
+
+def _research_results_artifact_payload(
+    *,
+    config: AppConfig,
+    project_root: Path,
+    results_path: Path | None,
+) -> dict[str, Any] | None:
+    if results_path is None:
+        return None
+    resolved_results_path = results_path.resolve()
+    identity, resolution = default_project_research_artifact_resolution(
+        config=config,
+        project_root=project_root.resolve(),
+    )
+    report_dir = config.storage.resolved(project_root.resolve()).report_dir
+    canonical_path = artifact_resolution_path(
+        resolution,
+        "research_csv",
+        report_dir / f"{identity['logical_prefix']}.csv",
+    )
+    resolved_via = str(resolution.get("resolved_via") or "") or None
+    if resolved_results_path != canonical_path:
+        resolved_via = "explicit_path"
+        canonical_path = resolved_results_path
+    return _artifact_file_payload(
+        path=resolved_results_path,
+        logical_prefix=str(identity["logical_prefix"]),
+        artifact_fingerprint=str(resolution.get("artifact_fingerprint") or identity["artifact_fingerprint"]),
+        resolved_via=resolved_via,
+        canonical_path=canonical_path,
     )
 
 
@@ -246,30 +629,41 @@ def evaluate_strategy_candidate(
     trades_path: Path | None = None,
     equity_curve_path: Path | None = None,
     notes: str = "",
+    artifact_payload_source: dict[str, Any] | None = None,
 ) -> tuple[StrategyCandidate, EvaluationReport]:
     _validate_role(evaluator_role)
     normalized_type = (evaluation_type or "backtest").strip().lower()
     if normalized_type not in EVALUATION_TYPES:
-        raise ValueError(f"Unsupported evaluation type: {evaluation_type}")
+        raise InvalidRequestError(
+            f"Unsupported evaluation type: {evaluation_type}",
+            error_code="unsupported_evaluation_type",
+        )
     if not summary_path.exists():
-        raise FileNotFoundError(f"Summary artifact not found: {summary_path}")
+        raise NotFoundError(
+            f"未找到摘要产物：{summary_path}",
+            error_code="summary_artifact_not_found",
+        )
 
     raw_summary = json.loads(summary_path.read_text(encoding="utf-8"))
     summary_metrics = _extract_summary_metrics(raw_summary)
     score_total = _evaluation_score(summary_metrics)
     status = _evaluation_status(summary_metrics=summary_metrics, score_total=score_total)
-    artifacts = {
-        "summary_path": str(summary_path),
-        "report_path": str(report_path) if report_path else None,
-        "trades_path": str(trades_path) if trades_path else None,
-        "equity_curve_path": str(equity_curve_path) if equity_curve_path else None,
-    }
+    artifacts = _artifact_payload_with_overrides(
+        artifact_payload_source,
+        summary_path=summary_path,
+        report_path=report_path,
+        trades_path=trades_path,
+        equity_curve_path=equity_curve_path,
+    )
     now = datetime.now(timezone.utc)
 
     with session_scope(session_factory) as session:
         candidate = session.get(StrategyCandidate, candidate_id)
         if candidate is None:
-            raise ValueError(f"Strategy candidate {candidate_id} does not exist.")
+            raise NotFoundError(
+                f"Strategy candidate {candidate_id} does not exist.",
+                error_code="strategy_candidate_not_found",
+            )
 
         report = EvaluationReport(
             candidate_id=candidate_id,
@@ -306,14 +700,23 @@ def approve_strategy_candidate(
     normalized_decision = (decision or "").strip().lower()
     normalized_scope = (scope or "demo").strip().lower()
     if normalized_decision not in APPROVAL_DECISIONS:
-        raise ValueError(f"Unsupported approval decision: {decision}")
+        raise InvalidRequestError(
+            f"Unsupported approval decision: {decision}",
+            error_code="unsupported_approval_decision",
+        )
     if normalized_scope not in APPROVAL_SCOPES:
-        raise ValueError(f"Unsupported approval scope: {scope}")
+        raise InvalidRequestError(
+            f"Unsupported approval scope: {scope}",
+            error_code="unsupported_approval_scope",
+        )
 
     with session_scope(session_factory) as session:
         candidate = session.get(StrategyCandidate, candidate_id)
         if candidate is None:
-            raise ValueError(f"Strategy candidate {candidate_id} does not exist.")
+            raise NotFoundError(
+                f"Strategy candidate {candidate_id} does not exist.",
+                error_code="strategy_candidate_not_found",
+            )
 
         approval = ApprovalDecision(
             candidate_id=candidate_id,
@@ -378,21 +781,33 @@ def backtest_strategy_candidate(
     with session_scope(session_factory) as session:
         candidate = session.get(StrategyCandidate, candidate_id)
         if candidate is None:
-            raise ValueError(f"Strategy candidate {candidate_id} does not exist.")
+            raise NotFoundError(
+                f"Strategy candidate {candidate_id} does not exist.",
+                error_code="strategy_candidate_not_found",
+            )
 
     candidate_config_path = _resolve_candidate_config_path(candidate=candidate, project_root=project_root)
     candidate_config = load_config(candidate_config_path)
     candidate_config.storage = candidate_config.storage.resolved(project_root.resolve())
     ensure_storage_dirs(candidate_config.storage)
-    artifact_paths = infer_strategy_candidate_artifacts(
-        candidate=candidate,
-        config=candidate_config,
-        project_root=project_root,
-    )
     symbols = configured_symbols(candidate_config)
 
     if len(symbols) == 1:
         symbol = symbols[0]
+        artifact_identity = candidate_backtest_artifact_identity(
+            config=candidate_config,
+            project_root=project_root.resolve(),
+            candidate_id=candidate.id,
+            candidate_name=candidate.candidate_name,
+            symbols=symbols,
+        )
+        legacy_prefix = candidate_report_prefix(candidate.candidate_name)
+        current_prefix = str(artifact_identity["logical_prefix"])
+        artifact_paths = backtest_artifact_paths(
+            storage=candidate_config.storage,
+            artifact_identity=artifact_identity,
+            include_dashboard=build_report,
+        )
         signal_bars, execution_bars, funding_rates, _symbol_slug_value = _load_candidate_symbol_datasets(
             config=candidate_config,
             storage=candidate_config.storage,
@@ -417,39 +832,72 @@ def backtest_strategy_candidate(
             trades=artifacts.trades,
             initial_equity=candidate_config.execution.initial_equity,
         )
-        _write_backtest_artifacts(
-            summary=summary,
-            trades=_trade_frame(artifacts.trades),
+        write_backtest_artifacts(
+            storage=candidate_config.storage,
+            report_prefix=current_prefix,
+            trades_frame=build_trades_frame(artifacts.trades),
             equity_curve=artifacts.equity_curve,
-            summary_path=Path(artifact_paths["summary_path"]),
-            trades_path=Path(artifact_paths["trades_path"]),
-            equity_curve_path=Path(artifact_paths["equity_curve_path"]),
+            summary=summary,
+            signal_frame=artifacts.signal_frame,
+            execution_bars=execution_bars,
+            artifact_identity=artifact_identity,
+            additional_legacy_report_prefixes=[legacy_prefix],
         )
         if build_report:
             render_dashboard(
-                summary_path=Path(artifact_paths["summary_path"]),
-                equity_curve_path=Path(artifact_paths["equity_curve_path"]),
-                trades_path=Path(artifact_paths["trades_path"]),
-                output_path=Path(artifact_paths["report_path"]),
-                title=f"{candidate.candidate_name} Backtest",
+                summary_path=artifact_paths["summary"],
+                equity_curve_path=artifact_paths["equity_curve"],
+                trades_path=artifact_paths["trades"],
+                output_path=artifact_paths["dashboard"],
+                title=f"{candidate.candidate_name} 回测",
             )
+            register_artifact_group(
+                report_dir=candidate_config.storage.report_dir,
+                identity=artifact_identity,
+                artifacts={"dashboard": artifact_paths["dashboard"]},
+                legacy_artifact_sets=_candidate_backtest_legacy_artifact_sets(
+                    storage=candidate_config.storage,
+                    current_prefix=current_prefix,
+                    legacy_prefix=legacy_prefix,
+                    include_dashboard=True,
+                ),
+            )
+        resolved_artifact_paths = infer_strategy_candidate_artifacts(
+            candidate=candidate,
+            config=candidate_config,
+            project_root=project_root,
+        )
         return {
             "mode": "single",
             "symbols": symbols,
             "summary": summary,
             "candidate": serialize_strategy_candidate(candidate),
             "config_path": str(candidate_config_path),
-            "artifacts": artifact_paths,
+            "artifacts": resolved_artifact_paths,
         }
 
     per_symbol_initial_equity = candidate_config.execution.initial_equity / len(symbols)
     equity_curves_by_symbol: dict[str, pd.DataFrame] = {}
+    artifacts_by_symbol: dict[str, BacktestArtifacts] = {}
     trades_by_symbol: dict[str, list[TradeRecord]] = {}
     all_trades: list[TradeRecord] = []
     sleeve_summaries: list[dict[str, Any]] = []
-
-    sleeve_paths = {entry["symbol"]: entry for entry in artifact_paths["sleeves"]}
     for symbol in symbols:
+        sleeve_identity = candidate_backtest_sleeve_artifact_identity(
+            config=candidate_config,
+            project_root=project_root.resolve(),
+            candidate_id=candidate.id,
+            candidate_name=candidate.candidate_name,
+            portfolio_symbols=symbols,
+            symbol=symbol,
+        )
+        legacy_sleeve_prefix = candidate_sleeve_report_prefix(candidate.candidate_name, symbol)
+        sleeve_prefix = str(sleeve_identity["logical_prefix"])
+        sleeve_paths = backtest_artifact_paths(
+            storage=candidate_config.storage,
+            artifact_identity=sleeve_identity,
+            include_dashboard=build_report,
+        )
         signal_bars, execution_bars, funding_rates, _symbol_slug_value = _load_candidate_symbol_datasets(
             config=candidate_config,
             storage=candidate_config.storage,
@@ -479,25 +927,39 @@ def backtest_strategy_candidate(
         summary["capital_allocation_pct"] = round(100 / len(symbols), 2)
         sleeve_summaries.append(summary)
 
-        sleeve_path = sleeve_paths[symbol]
-        _write_backtest_artifacts(
-            summary=summary,
-            trades=_trade_frame(artifacts.trades),
+        write_backtest_artifacts(
+            storage=candidate_config.storage,
+            report_prefix=sleeve_prefix,
+            trades_frame=build_trades_frame(artifacts.trades),
             equity_curve=artifacts.equity_curve,
-            summary_path=Path(sleeve_path["summary_path"]),
-            trades_path=Path(sleeve_path["trades_path"]),
-            equity_curve_path=Path(sleeve_path["equity_curve_path"]),
+            summary=summary,
+            signal_frame=artifacts.signal_frame,
+            execution_bars=execution_bars,
+            artifact_identity=sleeve_identity,
+            additional_legacy_report_prefixes=[legacy_sleeve_prefix],
         )
         if build_report:
             render_dashboard(
-                summary_path=Path(sleeve_path["summary_path"]),
-                equity_curve_path=Path(sleeve_path["equity_curve_path"]),
-                trades_path=Path(sleeve_path["trades_path"]),
-                output_path=Path(sleeve_path["report_path"]),
-                title=f"{candidate.candidate_name} {symbol} Sleeve",
+                summary_path=sleeve_paths["summary"],
+                equity_curve_path=sleeve_paths["equity_curve"],
+                trades_path=sleeve_paths["trades"],
+                output_path=sleeve_paths["dashboard"],
+                title=f"{candidate.candidate_name} {symbol} 子报表",
+            )
+            register_artifact_group(
+                report_dir=candidate_config.storage.report_dir,
+                identity=sleeve_identity,
+                artifacts={"dashboard": sleeve_paths["dashboard"]},
+                legacy_artifact_sets=_candidate_backtest_legacy_artifact_sets(
+                    storage=candidate_config.storage,
+                    current_prefix=sleeve_prefix,
+                    legacy_prefix=legacy_sleeve_prefix,
+                    include_dashboard=True,
+                ),
             )
 
         equity_curves_by_symbol[symbol] = artifacts.equity_curve
+        artifacts_by_symbol[symbol] = artifacts
         trades_by_symbol[symbol] = artifacts.trades
         all_trades.extend(artifacts.trades)
 
@@ -509,31 +971,76 @@ def backtest_strategy_candidate(
         initial_equity=candidate_config.execution.initial_equity,
         symbols=symbols,
     )
-    portfolio_summary["allocation_mode"] = "equal_weight"
-    portfolio_summary["per_symbol_initial_equity"] = round(per_symbol_initial_equity, 2)
-    _write_backtest_artifacts(
-        summary=portfolio_summary,
-        trades=portfolio_trades,
+    portfolio_summary = attach_equal_weight_portfolio_construction(
+        portfolio_summary,
+        per_symbol_initial_equity=per_symbol_initial_equity,
+    )
+    portfolio_allocation_overlay = build_portfolio_risk_budget_overlay(
+        symbol_artifacts=artifacts_by_symbol,
+        execution_config=candidate_config.execution,
+        risk_config=candidate_config.risk,
+    )
+    portfolio_summary = attach_portfolio_risk_budget_overlay(
+        portfolio_summary,
+        allocation_frame=portfolio_allocation_overlay,
+    )
+    portfolio_identity = candidate_backtest_artifact_identity(
+        config=candidate_config,
+        project_root=project_root.resolve(),
+        candidate_id=candidate.id,
+        candidate_name=candidate.candidate_name,
+        symbols=symbols,
+    )
+    legacy_portfolio_prefix = candidate_report_prefix(candidate.candidate_name)
+    portfolio_prefix = str(portfolio_identity["logical_prefix"])
+    artifact_paths = backtest_artifact_paths(
+        storage=candidate_config.storage,
+        artifact_identity=portfolio_identity,
+        include_dashboard=build_report,
+        include_allocation_overlay=True,
+    )
+    write_backtest_artifacts(
+        storage=candidate_config.storage,
+        report_prefix=portfolio_prefix,
+        trades_frame=portfolio_trades,
         equity_curve=portfolio_equity,
-        summary_path=Path(artifact_paths["summary_path"]),
-        trades_path=Path(artifact_paths["trades_path"]),
-        equity_curve_path=Path(artifact_paths["equity_curve_path"]),
+        summary=portfolio_summary,
+        allocation_overlay=portfolio_allocation_overlay,
+        artifact_identity=portfolio_identity,
+        additional_legacy_report_prefixes=[legacy_portfolio_prefix],
     )
     if build_report:
         render_dashboard(
-            summary_path=Path(artifact_paths["summary_path"]),
-            equity_curve_path=Path(artifact_paths["equity_curve_path"]),
-            trades_path=Path(artifact_paths["trades_path"]),
-            output_path=Path(artifact_paths["report_path"]),
-            title=f"{candidate.candidate_name} Portfolio Backtest",
+            summary_path=artifact_paths["summary"],
+            equity_curve_path=artifact_paths["equity_curve"],
+            trades_path=artifact_paths["trades"],
+            output_path=artifact_paths["dashboard"],
+            title=f"{candidate.candidate_name} 组合回测",
         )
+        register_artifact_group(
+            report_dir=candidate_config.storage.report_dir,
+            identity=portfolio_identity,
+            artifacts={"dashboard": artifact_paths["dashboard"]},
+            legacy_artifact_sets=_candidate_backtest_legacy_artifact_sets(
+                storage=candidate_config.storage,
+                current_prefix=portfolio_prefix,
+                legacy_prefix=legacy_portfolio_prefix,
+                include_dashboard=True,
+                include_allocation_overlay=True,
+            ),
+        )
+    resolved_artifact_paths = infer_strategy_candidate_artifacts(
+        candidate=candidate,
+        config=candidate_config,
+        project_root=project_root,
+    )
     return {
         "mode": "portfolio",
         "symbols": symbols,
         "summary": portfolio_summary,
         "candidate": serialize_strategy_candidate(candidate),
         "config_path": str(candidate_config_path),
-        "artifacts": artifact_paths,
+        "artifacts": resolved_artifact_paths,
         "sleeves": sleeve_summaries,
     }
 
@@ -565,6 +1072,7 @@ def evaluate_backtested_candidate(
         trades_path=Path(artifacts["trades_path"]),
         equity_curve_path=Path(artifacts["equity_curve_path"]),
         notes=notes,
+        artifact_payload_source=artifacts,
     )
     return {
         "candidate": serialize_strategy_candidate(candidate),
@@ -591,11 +1099,11 @@ def materialize_trend_research_candidates(
     _validate_role(owner_role)
     _validate_role(author_role)
     if top_n < 1:
-        raise ValueError("top_n must be >= 1")
+        raise InvalidRequestError("top_n must be >= 1", error_code="invalid_top_n")
 
     ranked = _prepare_research_results_frame(results_frame)
     if ranked.empty:
-        raise ValueError("Research results are empty.")
+        raise InvalidRequestError("Research results are empty.", error_code="empty_research_results")
 
     symbol = config.instrument.symbol
     selected_rows = ranked.head(top_n).reset_index(drop=True)
@@ -610,6 +1118,11 @@ def materialize_trend_research_candidates(
     )
     project_root = project_root.resolve()
     base_config_path = base_config_path.resolve()
+    results_artifact = _research_results_artifact_payload(
+        config=config,
+        project_root=project_root,
+        results_path=results_path,
+    )
 
     created_candidates: list[dict[str, Any]] = []
     for rank, (_, row) in enumerate(selected_rows.iterrows(), start=1):
@@ -669,6 +1182,7 @@ def materialize_trend_research_candidates(
     return {
         "task": serialize_research_task(research_task),
         "results_path": str(results_path.resolve()) if results_path is not None else None,
+        "results_artifact": results_artifact,
         "top_n": top_n,
         "created_count": len(created_candidates),
         "candidates": created_candidates,
@@ -867,9 +1381,9 @@ def serialize_research_task(task: ResearchTask) -> dict[str, Any]:
         "status": task.status,
         "symbols": task.symbols,
         "notes": task.notes,
-        "created_at": _serialize_datetime(task.created_at),
-        "updated_at": _serialize_datetime(task.updated_at),
-        "closed_at": _serialize_datetime(task.closed_at),
+        "created_at": serialize_utc_datetime(task.created_at),
+        "updated_at": serialize_utc_datetime(task.updated_at),
+        "closed_at": serialize_utc_datetime(task.closed_at),
     }
 
 
@@ -892,9 +1406,9 @@ def serialize_strategy_candidate(candidate: StrategyCandidate) -> dict[str, Any]
         "latest_evaluation_status": candidate.latest_evaluation_status,
         "latest_decision": candidate.latest_decision,
         "approval_scope": candidate.approval_scope,
-        "last_evaluated_at": _serialize_datetime(candidate.last_evaluated_at),
-        "created_at": _serialize_datetime(candidate.created_at),
-        "updated_at": _serialize_datetime(candidate.updated_at),
+        "last_evaluated_at": serialize_utc_datetime(candidate.last_evaluated_at),
+        "created_at": serialize_utc_datetime(candidate.created_at),
+        "updated_at": serialize_utc_datetime(candidate.updated_at),
     }
 
 
@@ -909,7 +1423,7 @@ def serialize_evaluation_report(report: EvaluationReport) -> dict[str, Any]:
         "summary_metrics": report.summary_metrics,
         "artifact_payload": report.artifact_payload,
         "notes": report.notes,
-        "created_at": _serialize_datetime(report.created_at),
+        "created_at": serialize_utc_datetime(report.created_at),
     }
 
 
@@ -921,7 +1435,7 @@ def serialize_approval_decision(decision: ApprovalDecision) -> dict[str, Any]:
         "decision": decision.decision,
         "scope": decision.scope,
         "reason": decision.reason,
-        "created_at": _serialize_datetime(decision.created_at),
+        "created_at": serialize_utc_datetime(decision.created_at),
     }
 
 
@@ -929,11 +1443,10 @@ def _validate_role(role: str) -> None:
     normalized = (role or "").strip().lower()
     if normalized not in AI_RESEARCH_ROLES:
         supported = ", ".join(sorted(AI_RESEARCH_ROLES))
-        raise ValueError(f"Unsupported role: {role}. Supported roles: {supported}")
-
-
-def _serialize_datetime(value: datetime | None) -> str | None:
-    return value.isoformat() if value is not None else None
+        raise InvalidRequestError(
+            f"Unsupported role: {role}. Supported roles: {supported}",
+            error_code="unsupported_research_role",
+        )
 
 
 def _clean_text_list(values: list[str] | tuple[str, ...] | None) -> list[str]:
@@ -1104,7 +1617,10 @@ def _prepare_research_results_frame(results_frame: pd.DataFrame) -> pd.DataFrame
     required = {"variant", "fast_ema", "slow_ema", "atr_stop_multiple"}
     missing = sorted(required - set(results_frame.columns))
     if missing:
-        raise ValueError(f"Research results are missing required columns: {', '.join(missing)}")
+        raise InvalidRequestError(
+            f"Research results are missing required columns: {', '.join(missing)}",
+            error_code="research_results_missing_columns",
+        )
 
     frame = results_frame.copy()
     if "research_score" in frame.columns:
@@ -1130,7 +1646,10 @@ def _resolve_research_task_for_materialization(
         with session_scope(session_factory) as session:
             task = session.get(ResearchTask, task_id)
             if task is None:
-                raise ValueError(f"Research task {task_id} does not exist.")
+                raise NotFoundError(
+                    f"Research task {task_id} does not exist.",
+                    error_code="research_task_not_found",
+                )
             return task
 
     return create_research_task(
@@ -1289,12 +1808,18 @@ def _fmt_metric(value: Any) -> str:
 def _resolve_candidate_config_path(*, candidate: StrategyCandidate, project_root: Path) -> Path:
     raw_path = str(candidate.config_path or "").strip()
     if not raw_path:
-        raise ValueError(f"Strategy candidate {candidate.id} does not have config_path.")
+        raise ConfigurationError(
+            f"Strategy candidate {candidate.id} does not have config_path.",
+            error_code="strategy_candidate_config_missing",
+        )
     config_path = Path(raw_path)
     if not config_path.is_absolute():
         config_path = (project_root / config_path).resolve()
     if not config_path.exists():
-        raise FileNotFoundError(f"Candidate config_path not found: {config_path}")
+        raise NotFoundError(
+            f"Candidate config_path not found: {config_path}",
+            error_code="strategy_candidate_config_not_found",
+        )
     return config_path
 
 
@@ -1310,7 +1835,10 @@ def _load_candidate_symbol_datasets(
     funding_path = storage.raw_dir / f"{symbol_slug}_funding.parquet"
     for path in (signal_path, execution_path, funding_path):
         if not path.exists():
-            raise FileNotFoundError(f"Missing required dataset: {path}")
+            raise NotFoundError(
+                f"Missing required dataset: {path}",
+                error_code="market_dataset_not_found",
+            )
 
     signal_bars = pd.read_parquet(signal_path)
     execution_bars = pd.read_parquet(execution_path)
@@ -1343,7 +1871,7 @@ def _resolve_candidate_instrument_config(
         payload = json.loads(metadata_path.read_text(encoding="utf-8"))
         return InstrumentConfig.model_validate(payload)
 
-    client = OkxPublicClient(base_url=config.okx.rest_base_url, proxy_url=config.okx.proxy_url)
+    client = build_market_data_provider(config)
     try:
         instrument = client.fetch_instrument_details(
             inst_type=config.instrument.instrument_type,
@@ -1353,45 +1881,6 @@ def _resolve_candidate_instrument_config(
         client.close()
     metadata_path.write_text(json.dumps(instrument, ensure_ascii=False, indent=2), encoding="utf-8")
     return InstrumentConfig.model_validate(instrument)
-
-
-def _write_backtest_artifacts(
-    *,
-    summary: dict[str, Any],
-    trades: pd.DataFrame,
-    equity_curve: pd.DataFrame,
-    summary_path: Path,
-    trades_path: Path,
-    equity_curve_path: Path,
-) -> None:
-    summary_path.parent.mkdir(parents=True, exist_ok=True)
-    trades_path.parent.mkdir(parents=True, exist_ok=True)
-    equity_curve_path.parent.mkdir(parents=True, exist_ok=True)
-    trades.to_csv(trades_path, index=False)
-    equity_curve.to_csv(equity_curve_path, index=False)
-    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def _trade_frame(trades: list[TradeRecord]) -> pd.DataFrame:
-    if not trades:
-        return pd.DataFrame(
-            columns=[
-                "signal_time",
-                "entry_time",
-                "exit_time",
-                "side",
-                "contracts",
-                "entry_price",
-                "exit_price",
-                "stop_price",
-                "gross_pnl",
-                "funding_pnl",
-                "fee_paid",
-                "net_pnl",
-                "exit_reason",
-            ]
-        )
-    return pd.DataFrame([trade.to_dict() for trade in trades])
 
 
 def _symbol_slug(symbol: str) -> str:

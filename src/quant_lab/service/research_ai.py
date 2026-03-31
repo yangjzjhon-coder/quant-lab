@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from typing import Any
+from typing import Protocol
 
 import httpx
 from pydantic import BaseModel, Field
 
 from quant_lab.config import AppConfig, ResearchAIConfig
+from quant_lab.errors import ConfigurationError, ExternalServiceError, InvalidRequestError
 
 SUPPORTED_RESEARCH_AI_PROVIDERS = {"disabled", "openai_compatible"}
 
@@ -52,11 +55,105 @@ class ResearchAIResponse(BaseModel):
     raw_response: dict[str, Any] = Field(default_factory=dict)
 
 
+class ResearchAIProvider(Protocol):
+    provider_name: str
+
+    def capabilities(self, *, cfg: ResearchAIConfig, configured: bool) -> list[str]: ...
+
+    def missing_configuration(self, *, cfg: ResearchAIConfig) -> list[str]: ...
+
+    def warnings(self, *, cfg: ResearchAIConfig) -> list[str]: ...
+
+    def probe(self, *, cfg: ResearchAIConfig) -> dict[str, Any]: ...
+
+    def run(self, *, cfg: ResearchAIConfig, request: ResearchAIRequest) -> dict[str, Any]: ...
+
+
+ResearchAIProviderFactory = Callable[[], ResearchAIProvider]
+
+
+class _OpenAICompatibleResearchAIProvider:
+    provider_name = "openai_compatible"
+
+    def capabilities(self, *, cfg: ResearchAIConfig, configured: bool) -> list[str]:
+        return ["chat_completion"] if configured else []
+
+    def missing_configuration(self, *, cfg: ResearchAIConfig) -> list[str]:
+        missing: list[str] = []
+        if not str(cfg.base_url or "").strip():
+            missing.append("base_url")
+        if not str(cfg.api_key or "").strip():
+            missing.append("api_key")
+        if not str(cfg.model or "").strip() and not cfg.role_models:
+            missing.append("model")
+        return missing
+
+    def warnings(self, *, cfg: ResearchAIConfig) -> list[str]:
+        warnings: list[str] = []
+        if not str(cfg.base_url or "").strip():
+            warnings.append("openai_compatible provider requires research_ai.base_url")
+        return warnings
+
+    def probe(self, *, cfg: ResearchAIConfig) -> dict[str, Any]:
+        endpoint = _build_endpoint(cfg.base_url, "models")
+        try:
+            payload = _request_json(
+                method="GET",
+                url=endpoint,
+                headers=_request_headers(cfg),
+                timeout_seconds=min(cfg.timeout_seconds, 15.0),
+                max_retries=0,
+            )
+            models = payload.get("data") if isinstance(payload.get("data"), list) else []
+            return {
+                "ok": True,
+                "endpoint": endpoint,
+                "model_count": len(models),
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "endpoint": endpoint,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+    def run(self, *, cfg: ResearchAIConfig, request: ResearchAIRequest) -> dict[str, Any]:
+        return _run_openai_compatible_request(cfg=cfg, request=request)
+
+
+_RESEARCH_AI_PROVIDER_REGISTRY: dict[str, ResearchAIProviderFactory] = {
+    "openai_compatible": _OpenAICompatibleResearchAIProvider,
+}
+
+
+def register_research_ai_provider(name: str, factory: ResearchAIProviderFactory) -> None:
+    normalized = _normalize_provider(name)
+    if normalized in {"", "disabled"}:
+        raise InvalidRequestError(
+            "research_ai provider name must be non-empty and cannot be 'disabled'",
+            error_code="invalid_research_ai_provider_name",
+        )
+    _RESEARCH_AI_PROVIDER_REGISTRY[normalized] = factory
+
+
+def get_research_ai_provider(provider: str | None) -> ResearchAIProvider | None:
+    normalized = _normalize_provider(provider)
+    if normalized == "disabled":
+        return None
+    factory = _RESEARCH_AI_PROVIDER_REGISTRY.get(normalized)
+    return None if factory is None else factory()
+
+
+def supported_research_ai_providers() -> list[str]:
+    return sorted({"disabled", *list(_RESEARCH_AI_PROVIDER_REGISTRY)})
+
+
 def build_research_ai_status(*, config: AppConfig, probe: bool = False) -> dict[str, Any]:
     cfg = config.research_ai
     provider = _normalize_provider(cfg.provider)
+    provider_impl = get_research_ai_provider(provider)
     missing = _missing_configuration(cfg=cfg, provider=provider)
-    supported = provider in SUPPORTED_RESEARCH_AI_PROVIDERS
+    supported = provider == "disabled" or provider_impl is not None
     configured = bool(cfg.enabled and supported and not missing)
 
     payload: dict[str, Any] = {
@@ -65,6 +162,7 @@ def build_research_ai_status(*, config: AppConfig, probe: bool = False) -> dict[
         "supported": supported,
         "configured": configured,
         "ready": configured,
+        "supported_providers": supported_research_ai_providers(),
         "model": cfg.model,
         "base_url": cfg.base_url,
         "timeout_seconds": cfg.timeout_seconds,
@@ -73,11 +171,13 @@ def build_research_ai_status(*, config: AppConfig, probe: bool = False) -> dict[
         "max_retries": cfg.max_retries,
         "api_key_configured": bool(cfg.api_key),
         "default_system_prompt_configured": bool(cfg.default_system_prompt),
+        "provider_options_keys": sorted((cfg.provider_options or {}).keys()),
         "role_models": _effective_role_models(cfg),
         "role_system_prompts": sorted((cfg.role_system_prompts or {}).keys()),
-        "capabilities": ["chat_completion"] if configured and provider == "openai_compatible" else [],
+        "capabilities": provider_impl.capabilities(cfg=cfg, configured=configured) if provider_impl is not None else [],
         "missing": missing,
         "warnings": _status_warnings(cfg=cfg, provider=provider),
+        "provider_help": _provider_help(cfg=cfg, provider=provider),
         "probe": None,
     }
 
@@ -91,23 +191,30 @@ def build_research_ai_status(*, config: AppConfig, probe: bool = False) -> dict[
 def run_research_ai_request(*, config: AppConfig, request: ResearchAIRequest) -> dict[str, Any]:
     cfg = config.research_ai
     provider = _normalize_provider(cfg.provider)
+    provider_impl = get_research_ai_provider(provider)
     missing = _missing_configuration(cfg=cfg, provider=provider)
     if not cfg.enabled:
-        raise ValueError("research_ai is disabled")
-    if provider not in SUPPORTED_RESEARCH_AI_PROVIDERS or provider == "disabled":
-        raise ValueError(f"unsupported research_ai provider: {provider}")
+        raise ConfigurationError("research_ai is disabled", error_code="research_ai_disabled")
+    if provider == "disabled" or provider_impl is None:
+        raise ConfigurationError(
+            f"unsupported research_ai provider: {provider}",
+            error_code="research_ai_provider_unsupported",
+        )
     if missing:
-        raise ValueError(f"research_ai is not fully configured: {', '.join(missing)}")
-
-    if provider == "openai_compatible":
-        return _run_openai_compatible_request(cfg=cfg, request=request)
-    raise ValueError(f"unsupported research_ai provider: {provider}")
+        raise ConfigurationError(
+            f"research_ai is not fully configured: {', '.join(missing)}",
+            error_code="research_ai_not_configured",
+        )
+    return provider_impl.run(cfg=cfg, request=request)
 
 
 def _run_openai_compatible_request(*, cfg: ResearchAIConfig, request: ResearchAIRequest) -> dict[str, Any]:
     model = _resolve_role_model(cfg=cfg, role=request.role)
     if not model:
-        raise ValueError(f"no model configured for role {request.role}")
+        raise ConfigurationError(
+            f"no model configured for role {request.role}",
+            error_code="research_ai_role_model_missing",
+        )
 
     payload: dict[str, Any] = {
         "model": model,
@@ -140,28 +247,9 @@ def _run_openai_compatible_request(*, cfg: ResearchAIConfig, request: ResearchAI
 
 
 def _probe_provider(*, cfg: ResearchAIConfig, provider: str) -> dict[str, Any]:
-    if provider == "openai_compatible":
-        endpoint = _build_endpoint(cfg.base_url, "models")
-        try:
-            payload = _request_json(
-                method="GET",
-                url=endpoint,
-                headers=_request_headers(cfg),
-                timeout_seconds=min(cfg.timeout_seconds, 15.0),
-                max_retries=0,
-            )
-            models = payload.get("data") if isinstance(payload.get("data"), list) else []
-            return {
-                "ok": True,
-                "endpoint": endpoint,
-                "model_count": len(models),
-            }
-        except Exception as exc:
-            return {
-                "ok": False,
-                "endpoint": endpoint,
-                "error": f"{type(exc).__name__}: {exc}",
-            }
+    provider_impl = get_research_ai_provider(provider)
+    if provider_impl is not None:
+        return provider_impl.probe(cfg=cfg)
     return {"ok": False, "error": f"unsupported research_ai provider: {provider}"}
 
 
@@ -183,12 +271,30 @@ def _request_json(
                 response.raise_for_status()
                 payload = response.json()
                 if not isinstance(payload, dict):
-                    raise ValueError("research_ai response must be a JSON object")
+                    raise ExternalServiceError(
+                        "research_ai response must be a JSON object",
+                        error_code="research_ai_invalid_response",
+                        retryable=False,
+                    )
                 return payload
-        except Exception as exc:
+        except ExternalServiceError as exc:
             last_error = exc
+        except httpx.HTTPError as exc:
+            last_error = ExternalServiceError(
+                f"{type(exc).__name__}: {exc}",
+                error_code="research_ai_http_error",
+            )
+        except Exception as exc:
+            last_error = ExternalServiceError(
+                f"{type(exc).__name__}: {exc}",
+                error_code="research_ai_request_failed",
+                retryable=False,
+            )
     if last_error is None:
-        raise RuntimeError("research_ai request failed without an explicit exception")
+        raise ExternalServiceError(
+            "research_ai request failed without an explicit exception",
+            error_code="research_ai_request_failed",
+        )
     raise last_error
 
 
@@ -250,7 +356,10 @@ def _build_endpoint(base_url: str | None, path: str) -> str:
     normalized_base_url = str(base_url or "").strip().rstrip("/")
     normalized_path = str(path).strip().lstrip("/")
     if not normalized_base_url:
-        raise ValueError("research_ai.base_url is not configured")
+        raise ConfigurationError(
+            "research_ai.base_url is not configured",
+            error_code="research_ai_base_url_missing",
+        )
     return f"{normalized_base_url}/{normalized_path}"
 
 
@@ -299,32 +408,54 @@ def _missing_configuration(*, cfg: ResearchAIConfig, provider: str) -> list[str]
     missing: list[str] = []
     if not cfg.enabled:
         return missing
-    if provider not in SUPPORTED_RESEARCH_AI_PROVIDERS:
-        missing.append("provider")
-        return missing
     if provider == "disabled":
         missing.append("provider")
         return missing
-    if not str(cfg.base_url or "").strip():
-        missing.append("base_url")
-    if not str(cfg.api_key or "").strip():
-        missing.append("api_key")
-    if not str(cfg.model or "").strip() and not cfg.role_models:
-        missing.append("model")
-    return missing
+    provider_impl = get_research_ai_provider(provider)
+    if provider_impl is None:
+        missing.append("provider")
+        return missing
+    return provider_impl.missing_configuration(cfg=cfg)
 
 
 def _status_warnings(*, cfg: ResearchAIConfig, provider: str) -> list[str]:
     warnings: list[str] = []
     if not cfg.enabled:
         warnings.append("research_ai is disabled")
-    if provider not in SUPPORTED_RESEARCH_AI_PROVIDERS:
+    provider_impl = get_research_ai_provider(provider)
+    if provider not in {"disabled"} and provider_impl is None:
         warnings.append(f"unsupported provider configured: {provider}")
-    if provider == "openai_compatible" and not str(cfg.base_url or "").strip():
-        warnings.append("openai_compatible provider requires research_ai.base_url")
+    if provider_impl is not None:
+        warnings.extend(provider_impl.warnings(cfg=cfg))
     return warnings
 
 
 def _normalize_provider(provider: str | None) -> str:
     normalized = str(provider or "").strip().lower()
     return normalized or "disabled"
+
+
+def _provider_help(*, cfg: ResearchAIConfig, provider: str) -> dict[str, Any]:
+    if provider == "openai_compatible":
+        return {
+            "required": ["base_url", "api_key", "model"],
+            "example_env": {
+                "RESEARCH_AI_ENABLED": "true",
+                "RESEARCH_AI_PROVIDER": "openai_compatible",
+                "RESEARCH_AI_BASE_URL": "https://api.openai.com/v1",
+                "RESEARCH_AI_API_KEY": "set-in-env",
+                "RESEARCH_AI_MODEL": "gpt-5-mini",
+            },
+            "example_context": {
+                "candidate_id": 12,
+                "symbols": ["BTC-USDT-SWAP", "ETH-USDT-SWAP"],
+            },
+            "notes": [
+                "Custom providers can consume research_ai.provider_options.",
+                "Role-specific model overrides are configured through research_ai.role_models.",
+            ],
+        }
+    return {
+        "required": ["provider"],
+        "available": supported_research_ai_providers(),
+    }

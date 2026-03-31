@@ -4,7 +4,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DATA_DIR="${PROJECT_DIR}/data"
-PYTHON_BIN="${PROJECT_DIR}/.venv/bin/python"
 CONFIG_PATH="config/settings.yaml"
 RUNNER_SCRIPT="${SCRIPT_DIR}/guarded_runner.sh"
 
@@ -18,6 +17,29 @@ DEMO_PID_FILE="${DATA_DIR}/demo-loop.pid"
 DEMO_PATTERN="python -m quant_lab demo-.*loop --config ${CONFIG_PATH}"
 
 mkdir -p "${DATA_DIR}"
+
+resolve_python_bin() {
+  local candidates=(
+    "${PROJECT_DIR}/.venv/bin/python"
+    "${PROJECT_DIR}/.venv/Scripts/python.exe"
+    "${PROJECT_DIR}/.venv/Scripts/python"
+  )
+  local candidate
+  for candidate in "${candidates[@]}"; do
+    if [[ -x "${candidate}" || -f "${candidate}" ]]; then
+      printf '%s' "${candidate}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+PYTHON_BIN="$(resolve_python_bin || true)"
+if [[ -z "${PYTHON_BIN}" ]]; then
+  echo "quant-lab runtime could not find a Python interpreter under ${PROJECT_DIR}/.venv" >&2
+  echo "expected one of: .venv/bin/python or .venv/Scripts/python.exe" >&2
+  exit 1
+fi
 
 stop_systemd_unit() {
   local uid
@@ -131,7 +153,7 @@ from quant_lab.config import configured_symbols, load_config
 cfg = load_config(Path("config/settings.yaml"))
 print("demo-portfolio-loop" if len(configured_symbols(cfg)) > 1 else "demo-loop")
 PY
-  )
+  ) | tr -d '\r'
 }
 
 runtime_env_prefix() {

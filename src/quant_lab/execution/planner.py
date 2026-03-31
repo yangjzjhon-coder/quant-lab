@@ -9,6 +9,7 @@ from quant_lab.backtest.realism import bar_liquidity_quote, cap_contracts_by_liq
 from quant_lab.backtest.engine import _entry_fill_price
 from quant_lab.config import ExecutionConfig, InstrumentConfig, RiskConfig, StrategyConfig, TradingConfig
 from quant_lab.risk.rules import position_size_from_risk
+from quant_lab.strategy_contracts import AlphaSignalContract, RiskSignalContract, execution_signal_from_row
 from quant_lab.strategies.ema_trend import prepare_signal_frame
 from quant_lab.utils.timeframes import bar_to_timedelta
 
@@ -29,6 +30,10 @@ class SignalSnapshot:
     strategy_score: float | None = None
     strategy_risk_multiplier: float = 1.0
     signal_stop_price: float | None = None
+    regime: str | None = None
+    route_key: str | None = None
+    alpha_signal: AlphaSignalContract | None = None
+    risk_signal: RiskSignalContract | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -162,8 +167,14 @@ def build_signal_snapshot(
 
     latest_signal = signal_frame.iloc[-1]
     previous_side = int(signal_frame["desired_side"].iloc[-2]) if len(signal_frame) > 1 else 0
+    signal_contract = execution_signal_from_row(
+        latest_signal,
+        previous_side=previous_side,
+        strategy_name=strategy_config.name,
+        strategy_variant=strategy_config.variant,
+    )
     latest_execution = normalized_execution.iloc[-1]
-    signal_time = pd.Timestamp(latest_signal["timestamp"])
+    signal_time = signal_contract.signal_time
     effective_time = (
         signal_time
         + bar_to_timedelta(strategy_config.signal_bar)
@@ -189,15 +200,16 @@ def build_signal_snapshot(
         latest_high=latest_high,
         latest_low=latest_low,
         latest_liquidity_quote=latest_liquidity_quote,
-        desired_side=int(latest_signal["desired_side"]),
+        desired_side=signal_contract.desired_side,
         previous_side=previous_side,
-        stop_distance=float(latest_signal["stop_distance"]),
-        strategy_score=_to_float(
-            latest_signal.get("strategy_score"),
-            fallback=_to_float(latest_signal.get("long_factor_score"), fallback=None),
-        ),
-        strategy_risk_multiplier=_to_float(latest_signal.get("strategy_risk_multiplier"), fallback=1.0) or 1.0,
-        signal_stop_price=_signal_stop_price(latest_signal),
+        stop_distance=signal_contract.risk_signal.stop_distance,
+        strategy_score=signal_contract.alpha_signal.score,
+        strategy_risk_multiplier=signal_contract.risk_signal.risk_multiplier,
+        signal_stop_price=signal_contract.risk_signal.stop_price,
+        regime=signal_contract.alpha_signal.regime,
+        route_key=signal_contract.route_key,
+        alpha_signal=signal_contract.alpha_signal,
+        risk_signal=signal_contract.risk_signal,
         ready=latest_execution_time >= effective_time,
     )
 
