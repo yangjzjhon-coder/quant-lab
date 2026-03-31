@@ -1387,17 +1387,7 @@ def build_demo_visuals_payload(
         point.get("mode") == "portfolio" for point in chart_points
     )
 
-    alert_feed = [
-        {
-            "event_key": item.event_key,
-            "channel": item.channel,
-            "status": item.status,
-            "title": item.title,
-            "message": item.message,
-            "created_at": serialize_utc_datetime(item.created_at),
-        }
-        for item in alerts
-    ]
+    alert_feed = [serialize_alert_event(item) for item in alerts]
 
     if portfolio_mode:
         symbol_states = reconcile.get("symbol_states") or {}
@@ -2222,7 +2212,6 @@ def _load_executor_state_path_info(
     if not path.exists():
         return {
             "status": "missing",
-            "status_label": ui_code_label("missing"),
             "path": str(path),
             "legacy_fallback_used": legacy_fallback_used,
             "mode": mode,

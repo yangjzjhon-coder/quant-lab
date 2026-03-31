@@ -136,6 +136,8 @@ def test_build_demo_visuals_payload_summarizes_demo_history(tmp_path: Path) -> N
     assert payload["recent_events"][0]["current_side_label"] == "做空"
     assert payload["recent_events"][0]["desired_side_label"] == "做空"
     assert payload["recent_alerts"][0]["event_key"] == "demo_order_submitted"
+    assert payload["recent_alerts"][0]["status_label"] == "已发送"
+    assert payload["recent_alerts"][0]["delivered_at"].endswith("+00:00")
 
 
 def test_build_demo_visuals_payload_summary_prefers_serialized_history_status_label(

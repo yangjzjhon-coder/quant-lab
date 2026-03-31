@@ -155,3 +155,4 @@
 - 收口 `demo_visuals.summary.last_status_label` 的重复解释路径，让 demo 历史摘要优先消费 heartbeat history 已序列化的 `status_label`，只在缺失时回退到共享状态映射，并补齐对应 client visuals 回归测试。
 - 收口 `client headline` 对 loop 状态的重复翻译路径，让 `build_client_headline_summary(...)` 优先消费 `autotrade_status.latest_loop_status_label` / heartbeat 已序列化 `status_label`，避免 headline 再次本地翻译状态码。
 - 收口 `runtime dashboard summary` 对 loop 状态标签的本地重算，让 `_runtime_dashboard_loop_summary(...)` 直接携带 `status_label`，并让 `dashboard_summary.loop.label` 优先消费已序列化标签，而不是在 summary 层再次翻译状态码。
+- 收口 `demo_visuals.recent_alerts` 的本地 alert 序列化分支，改为直接复用共享 `serialize_alert_event(...)`，让 client-side demo visuals 与 monitor alerts endpoint 共享同一 alert 输出合同。
