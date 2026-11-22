@@ -254,50 +254,13 @@ quant-lab service-api --config config/settings.yaml
 - `http://127.0.0.1:18080/reports/sweep`
   - 参数扫描 HTML 报表
 
-## Windows 一键启动
+## 启动脚本
 
-仓库里已经附带：
+Windows 侧的启动/停止脚本属于本地环境定制，未包含在仓库中。直接运行服务即可：
 
-- `scripts/QuantLab启动.ps1`
-- `scripts/QuantLab停止.ps1`
-- `scripts/QuantLab启动.cmd`
-- `scripts/QuantLab停止.cmd`
-- `scripts/StartQuantLabClient.ps1`
-- `scripts/StartQuantLabClient.cmd`
-
-同时我也放了桌面快捷入口：
-
-- `%USERPROFILE%\Desktop\`QuantLab启动.cmd`
-- `%USERPROFILE%\Desktop\`QuantLab停止.cmd`
-
-推荐你以后直接双击桌面的 `QuantLab启动.cmd`。
-
-更简单的桌面入口也已经放好：
-
-- `%USERPROFILE%\Desktop\`启动量化系统.cmd`
-- `%USERPROFILE%\Desktop\`停止量化系统.cmd`
-- `%USERPROFILE%\Desktop\`打开交易客户端.cmd`
-
-这套脚本会：
-
-- 在 `WSL Ubuntu-24.04` 里后台启动 `quant-lab service-api`
-- 刷新 `127.0.0.1:18080 -> WSL_IP:18080` 的 `portproxy`
-- 检查 `http://127.0.0.1:18080/health`
-- 自动打开运行面板
-
-如果你只想直接进入交易客户端，双击：
-
-- `scripts/StartQuantLabClient.cmd`
-- `%USERPROFILE%\Desktop\`打开交易客户端.cmd`
-
-它会先确保服务已经起来，然后直接打开：
-
-- `http://127.0.0.1:18080/client`
-
-注意：
-
-- 第一次冷启动可能要 `20-45 秒`
-- 如果刚双击后浏览器还没打开，不要重复启动，先等脚本跑完
+```bash
+quant-lab service-api --config config/settings.yaml
+```
 
 如果你想在 WSL 里手动控制，也可以用：
 
