@@ -1,4 +1,0 @@
-$ErrorActionPreference = "Stop"
-
-& "$PSScriptRoot\StartQuantLab.ps1" -AutoSubmit -Restart -OpenPath "/client"
-exit $LASTEXITCODE

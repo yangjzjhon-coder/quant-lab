@@ -18,3 +18,10 @@ data/**
 *.log
 .coverage
 htmlcov/
+*.egg-info/
+build/
+dist/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
